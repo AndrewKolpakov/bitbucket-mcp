@@ -3,6 +3,12 @@ import type winston from "winston";
 
 export const BITBUCKET_DEFAULT_PAGELEN = 10;
 export const BITBUCKET_MAX_PAGELEN = 100;
+/**
+ * `/pullrequests` and `/pullrequests/{id}/activity` reject anything above 50
+ * with `400 Invalid pagelen` — verified against api.bitbucket.org, the docs do
+ * not mention it. Every other collection accepts 100.
+ */
+export const BITBUCKET_PULLREQUEST_MAX_PAGELEN = 50;
 export const BITBUCKET_ALL_ITEMS_CAP = 1000;
 
 export interface PaginationRequestOptions {
@@ -11,6 +17,8 @@ export interface PaginationRequestOptions {
   all?: boolean;
   params?: Record<string, any>;
   defaultPagelen?: number;
+  /** Endpoint-specific ceiling for `pagelen`. Defaults to Bitbucket's 100. */
+  maxPagelen?: number;
   maxItems?: number;
   description?: string;
 }
@@ -38,6 +46,69 @@ interface PendingRequestConfig {
   params?: Record<string, any>;
 }
 
+export interface PaginationArgs {
+  pagelen?: number;
+  page?: number;
+  all?: boolean;
+  /** Deprecated alias kept for backward compatibility. Treated as `maxItems`. */
+  limit?: number;
+  maxItems?: number;
+  /** Endpoint-specific ceiling for `pagelen`. Defaults to Bitbucket's 100. */
+  maxPagelen?: number;
+}
+
+export interface ResolvedPagination {
+  pagelen?: number;
+  page?: number;
+  all?: boolean;
+  maxItems?: number;
+  maxPagelen?: number;
+}
+
+/**
+ * Turn the tool-level pagination arguments into paginator options.
+ *
+ * `limit` used to be a plain alias for `pagelen`, so `limit: 500` quietly
+ * returned 100 items (Bitbucket's page cap) and nothing said so. It is now a
+ * total-item budget: the page size is derived from it and pages are followed
+ * automatically until the budget is spent.
+ */
+export function resolvePagination(args: PaginationArgs): ResolvedPagination {
+  const {
+    pagelen,
+    page,
+    all,
+    limit,
+    maxItems,
+    maxPagelen = BITBUCKET_MAX_PAGELEN,
+  } = args;
+  const budget = maxItems ?? limit;
+
+  const resolvedPagelen =
+    pagelen !== undefined
+      ? Math.min(pagelen, maxPagelen)
+      : budget !== undefined && budget > 0
+        ? Math.min(budget, maxPagelen)
+        : undefined;
+
+  const effectivePagelen = resolvedPagelen ?? BITBUCKET_DEFAULT_PAGELEN;
+  // An explicit `all` always wins; otherwise a budget larger than one page
+  // implies the caller wants those pages followed.
+  const resolvedAll =
+    all ??
+    (budget !== undefined && page === undefined && budget > effectivePagelen
+      ? true
+      : undefined);
+
+  return {
+    pagelen: resolvedPagelen,
+    page,
+    all: resolvedAll,
+    maxItems: budget,
+    maxPagelen,
+  };
+}
+
 export class BitbucketPaginator {
   constructor(
     private readonly api: AxiosInstance,
@@ -54,12 +125,14 @@ export class BitbucketPaginator {
       all = false,
       params = {},
       defaultPagelen = BITBUCKET_DEFAULT_PAGELEN,
+      maxPagelen = BITBUCKET_MAX_PAGELEN,
       maxItems = BITBUCKET_ALL_ITEMS_CAP,
       description,
     } = options;
 
     const resolvedPagelen = this.normalizePagelen(
-      pagelen ?? defaultPagelen
+      pagelen ?? defaultPagelen,
+      maxPagelen
     );
     const requestParams: Record<string, any> = {
       ...params,
@@ -202,14 +275,17 @@ export class BitbucketPaginator {
     return [];
   }
 
-  private normalizePagelen(value?: number): number {
+  private normalizePagelen(
+    value?: number,
+    maxPagelen: number = BITBUCKET_MAX_PAGELEN
+  ): number {
     if (value === undefined || Number.isNaN(value)) {
-      return BITBUCKET_DEFAULT_PAGELEN;
+      return Math.min(BITBUCKET_DEFAULT_PAGELEN, maxPagelen);
     }
     const integer = Math.floor(value);
     if (!Number.isFinite(integer) || integer < 1) {
       return 1;
     }
-    return Math.min(integer, BITBUCKET_MAX_PAGELEN);
+    return Math.min(integer, maxPagelen);
   }
 }

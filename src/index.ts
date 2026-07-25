@@ -18,8 +18,50 @@ import {
   BITBUCKET_ALL_ITEMS_CAP,
   BITBUCKET_DEFAULT_PAGELEN,
   BITBUCKET_MAX_PAGELEN,
+  BITBUCKET_PULLREQUEST_MAX_PAGELEN,
 } from "./pagination.js";
+import { resolvePagination } from "./pagination.js";
 import type { PaginatedValuesResult } from "./pagination.js";
+import { attachRetryInterceptor, DEFAULT_MAX_RETRIES } from "./retry.js";
+import {
+  isPendingReviewer,
+  rankPendingReviewPRs,
+  repositorySlug,
+} from "./pending-review.js";
+
+/**
+ * Per-repository ceiling when scanning open pull requests for review requests.
+ * Repositories that hit it are reported in `truncated_repositories`.
+ */
+const MAX_OPEN_PRS_PER_REPOSITORY = 500;
+
+/**
+ * Bitbucket explains its 4xx responses in the body; axios only gives you
+ * "Request failed with status code 400", which is useless for diagnosing a
+ * bad `q`, `sort` or `fields` value. Append the server's own message.
+ */
+function describeError(error: unknown): string {
+  if (!axios.isAxiosError(error)) {
+    return describeError(error);
+  }
+  const data: any = error.response?.data;
+  const detail =
+    data?.error?.message ??
+    data?.error?.detail ??
+    (typeof data === "string" ? data.slice(0, 300) : undefined);
+  const fields = data?.error?.fields
+    ? ` (${JSON.stringify(data.error.fields)})`
+    : "";
+  return detail ? `${error.message}: ${detail}${fields}` : error.message;
+}
+
+/** `BITBUCKET_MAX_RETRIES=0` disables retries; anything unparseable falls back. */
+function resolveMaxRetries(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_MAX_RETRIES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MAX_RETRIES;
+  return Math.floor(parsed);
+}
 
 // =========== LOGGER SETUP ==========
 // File-based logging with sensible defaults and ability to disable
@@ -88,29 +130,41 @@ const logger = winston.createLogger({
     : [],
 });
 
-const PAGINATION_BASE_SCHEMA = {
+/**
+ * `maxPagelen` differs per endpoint: `/pullrequests` and its activity log
+ * reject anything above 50 with `400 Invalid pagelen`.
+ */
+const paginationBaseSchema = (
+  maxPagelen: number = BITBUCKET_MAX_PAGELEN
+) => ({
   pagelen: {
     type: "number",
     minimum: 1,
-    maximum: BITBUCKET_MAX_PAGELEN,
-    description: `Number of items per page (Bitbucket pagelen). Defaults to ${BITBUCKET_DEFAULT_PAGELEN} and caps at ${BITBUCKET_MAX_PAGELEN}.`,
+    maximum: maxPagelen,
+    description: `Number of items per page (Bitbucket pagelen). Defaults to ${BITBUCKET_DEFAULT_PAGELEN} and caps at ${maxPagelen}.`,
   },
   page: {
     type: "number",
     minimum: 1,
     description: "Bitbucket page number to fetch (1-based).",
   },
-};
+});
 
 const PAGINATION_ALL_SCHEMA = {
   type: "boolean",
-  description: `When true (and no page is provided), automatically follows Bitbucket next links to return all items up to ${BITBUCKET_ALL_ITEMS_CAP}.`,
+  description: `When true (and no page is provided), automatically follows Bitbucket next links to return all items up to maxItems (default ${BITBUCKET_ALL_ITEMS_CAP}).`,
+};
+
+const PAGINATION_MAX_ITEMS_SCHEMA = {
+  type: "number",
+  minimum: 1,
+  description: `Total number of items to return across pages. Pages are followed automatically until this budget is spent. Defaults to ${BITBUCKET_ALL_ITEMS_CAP} when 'all' is set.`,
 };
 
 const LEGACY_LIMIT_SCHEMA = {
   type: "number",
   description:
-    "Deprecated alias for pagelen. Use pagelen/page/all for pagination control.",
+    "Deprecated alias for maxItems: the total number of items to return (not the page size). Prefer maxItems/pagelen/page/all.",
 };
 
 /**
@@ -611,6 +665,13 @@ class BitbucketServer {
           : undefined,
     });
 
+    // Retry transient failures on reads. Following `next` links can fire ten
+    // requests back to back, and a single 429 used to discard every page
+    // already collected.
+    attachRetryInterceptor(this.api, logger, {
+      maxRetries: resolveMaxRetries(process.env.BITBUCKET_MAX_RETRIES),
+    });
+
     this.paginator = new BitbucketPaginator(this.api, logger);
 
     // Setup tool handlers using the request handler pattern
@@ -645,9 +706,10 @@ class BitbucketServer {
                 description:
                   "Filter by the authenticated user's role on each repository.",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
               limit: LEGACY_LIMIT_SCHEMA,
             },
           },
@@ -683,9 +745,10 @@ class BitbucketServer {
                 enum: ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"],
                 description: "Pull request state",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(BITBUCKET_PULLREQUEST_MAX_PAGELEN),
               ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
               limit: LEGACY_LIMIT_SCHEMA,
             },
             required: ["workspace", "repo_slug"],
@@ -751,8 +814,9 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -796,8 +860,9 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(BITBUCKET_PULLREQUEST_MAX_PAGELEN),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -817,8 +882,9 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -838,8 +904,9 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -904,9 +971,10 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -945,8 +1013,9 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -1382,8 +1451,9 @@ class BitbucketServer {
                 description: "Bitbucket workspace name",
               },
               repo_slug: { type: "string", description: "Repository slug" },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
               limit: LEGACY_LIMIT_SCHEMA,
               status: {
                 type: "string",
@@ -1430,8 +1500,9 @@ class BitbucketServer {
                 type: "string",
                 description: "Pipeline UUID",
               },
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pipeline_uuid"],
           },
@@ -1531,6 +1602,11 @@ class BitbucketServer {
                 type: "string",
                 description: "Pipeline UUID",
               },
+              // Same gap as getPullRequestTasks: the handler paginates, the
+              // schema did not say so, so a 16-step pipeline showed 10 steps.
+              ...paginationBaseSchema(),
+              all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pipeline_uuid"],
           },
@@ -1793,9 +1869,10 @@ class BitbucketServer {
               },
               // The handler has always accepted these; they were just missing
               // from the schema, so callers could never reach past page 1.
-              ...PAGINATION_BASE_SCHEMA,
+              ...paginationBaseSchema(),
               ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -1967,7 +2044,8 @@ class BitbucketServer {
               args.limit as number,
               args.q as string,
               args.sort as string,
-              args.role as string
+              args.role as string,
+              args.maxItems as number
             );
           case "getRepository":
             return await this.getRepository(
@@ -1984,7 +2062,8 @@ class BitbucketServer {
               args.all as boolean,
               args.limit as number,
               args.q as string,
-              args.sort as string
+              args.sort as string,
+              args.maxItems as number
             );
           case "createPullRequest":
             return await this.createPullRequest(
@@ -2018,7 +2097,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.maxItems as number
             );
           case "approvePullRequest":
             return await this.approvePullRequest(
@@ -2056,7 +2136,8 @@ class BitbucketServer {
               args.page as number,
               args.all as boolean,
               args.q as string,
-              args.sort as string
+              args.sort as string,
+              args.maxItems as number
             );
           case "getPullRequestDiff":
             return await this.getPullRequestDiff(
@@ -2071,7 +2152,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.maxItems as number
             );
           case "addPullRequestComment":
             return await this.addPullRequestComment(
@@ -2187,7 +2269,8 @@ class BitbucketServer {
                 | "pullrequest"
                 | "schedule",
               args.limit as number,
-              args.sort as string
+              args.sort as string,
+              args.maxItems as number
             );
           case "getPipelineRun":
             return await this.getPipelineRun(
@@ -2215,7 +2298,8 @@ class BitbucketServer {
               args.pipeline_uuid as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.maxItems as number
             );
           case "getPipelineStep":
             return await this.getPipelineStep(
@@ -2281,7 +2365,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.maxItems as number
             );
           case "getPullRequestPatch":
             return await this.getPullRequestPatch(
@@ -2298,7 +2383,8 @@ class BitbucketServer {
               args.page as number,
               args.all as boolean,
               args.q as string,
-              args.sort as string
+              args.sort as string,
+              args.maxItems as number
             );
           case "createPullRequestTask":
             return await this.createPullRequestTask(
@@ -2339,7 +2425,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.maxItems as number
             );
           case "getEffectiveDefaultReviewers":
             return await this.getEffectiveDefaultReviewers(
@@ -2376,7 +2463,8 @@ class BitbucketServer {
     legacyLimit?: number,
     q?: string,
     sort?: string,
-    role?: string
+    role?: string,
+    maxItems?: number
   ) {
     try {
       // Use default workspace if not provided
@@ -2417,9 +2505,13 @@ class BitbucketServer {
       const repositories = await this.paginator.fetchValues<BitbucketRepository>(
         `/repositories/${wsName}`,
         {
-          pagelen: pagelen ?? legacyLimit,
-          page,
-          all,
+          ...resolvePagination({
+            pagelen,
+            page,
+            all,
+            limit: legacyLimit,
+            maxItems,
+          }),
           params,
           description: "listRepositories",
         }
@@ -2431,7 +2523,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to list repositories: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2461,7 +2553,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get repository: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2495,7 +2587,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get effective default reviewers: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2510,7 +2602,8 @@ class BitbucketServer {
     all?: boolean,
     legacyLimit?: number,
     q?: string,
-    sort?: string
+    sort?: string,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting Bitbucket pull requests", {
@@ -2532,9 +2625,14 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues<BitbucketPullRequest>(
         `/repositories/${workspace}/${repo_slug}/pullrequests`,
         {
-          pagelen: pagelen ?? legacyLimit,
-          page,
-          all,
+          ...resolvePagination({
+            pagelen,
+            page,
+            all,
+            limit: legacyLimit,
+            maxItems,
+            maxPagelen: BITBUCKET_PULLREQUEST_MAX_PAGELEN,
+          }),
           params,
           description: "getPullRequests",
         }
@@ -2550,7 +2648,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull requests: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2641,7 +2739,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to create pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2681,7 +2779,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request details: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2729,7 +2827,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2741,7 +2839,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting Bitbucket pull request activity", {
@@ -2756,9 +2855,13 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/activity`,
         {
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({
+            pagelen,
+            page,
+            all,
+            maxItems,
+            maxPagelen: BITBUCKET_PULLREQUEST_MAX_PAGELEN,
+          }),
           description: "getPullRequestActivity",
         }
       );
@@ -2774,7 +2877,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request activity: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2817,7 +2920,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to approve pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2857,7 +2960,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to unapprove pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2902,7 +3005,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to decline pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2951,7 +3054,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to merge pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -2965,7 +3068,8 @@ class BitbucketServer {
     page?: number,
     all?: boolean,
     q?: string,
-    sort?: string
+    sort?: string,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting Bitbucket pull request comments", {
@@ -2984,9 +3088,7 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         {
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({ pagelen, page, all, maxItems }),
           params,
           description: "getPullRequestComments",
         }
@@ -3003,7 +3105,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request comments: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3059,7 +3161,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request diff: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3071,7 +3173,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting Bitbucket pull request commits", {
@@ -3086,9 +3189,7 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/commits`,
         {
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({ pagelen, page, all, maxItems }),
           description: "getPullRequestCommits",
         }
       );
@@ -3104,7 +3205,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request commits: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3183,7 +3284,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to add pull request comment: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3217,7 +3318,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get repository branching model: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3254,7 +3355,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get repository branching model settings: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3304,7 +3405,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update repository branching model settings: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3341,7 +3442,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get effective repository branching model: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3375,7 +3476,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get project branching model: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3412,7 +3513,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get project branching model settings: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3462,7 +3563,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update project branching model settings: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3502,7 +3603,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to add pending pull request comment: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3574,7 +3675,7 @@ class BitbucketServer {
           publishResults.push({
             commentId: comment.id,
             status: "error",
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
           });
         }
       }
@@ -3604,7 +3705,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to publish pending comments: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3648,7 +3749,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to create draft pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3692,7 +3793,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to publish draft pull request: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3736,7 +3837,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to convert pull request to draft: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3798,13 +3899,21 @@ class BitbucketServer {
           );
         }
 
-        repositoriesToCheck = reposResponse.values.map((repo: any) => repo.name);
+        // `repo.name` is the display name ("AI-Chat"), not the URL slug
+        // ("ai-chat"); using it 404'd for every repository whose name and slug
+        // differ, and the error was swallowed further down.
+        repositoriesToCheck = reposResponse.values
+          .map((repo: any) => repositorySlug(repo))
+          .filter((slug: string | undefined): slug is string => Boolean(slug));
         logger.info(
           `Found ${repositoriesToCheck.length} repositories to check`
         );
       }
 
       const pendingPRs: any[] = [];
+      const failedRepositories: Array<{ repository: string; error: string }> =
+        [];
+      const truncatedRepositories: string[] = [];
       const batchSize = 5; // Process repositories in batches to avoid overwhelming the API
 
       // Process repositories in batches
@@ -3816,55 +3925,32 @@ class BitbucketServer {
           try {
             logger.info(`Checking repository: ${repoSlug}`);
 
-            // Get open PRs for this repository with participants expanded
-            const prsResponse = await this.api.get(
+            // Every open PR matters here: the reviewer filter runs client-side,
+            // so stopping at the first page silently hid review requests in
+            // repositories with more open PRs than one page.
+            const prsResult = await this.paginator.fetchValues(
               `/repositories/${wsName}/${repoSlug}/pullrequests`,
               {
+                pagelen: BITBUCKET_PULLREQUEST_MAX_PAGELEN,
+                maxPagelen: BITBUCKET_PULLREQUEST_MAX_PAGELEN,
+                all: true,
+                maxItems: MAX_OPEN_PRS_PER_REPOSITORY,
                 params: {
                   state: "OPEN",
-                  pagelen: Math.min(limit, 50), // Limit per repo to avoid too much data
                   fields:
-                    "values.id,values.title,values.description,values.state,values.created_on,values.updated_on,values.author,values.source,values.destination,values.participants.user.nickname,values.participants.role,values.participants.approved,values.links",
+                    "next,values.id,values.title,values.description,values.state,values.created_on,values.updated_on,values.author,values.source,values.destination,values.participants.user.nickname,values.participants.role,values.participants.approved,values.links",
                 },
+                description: `getPendingReviewPRs.pullrequests.${repoSlug}`,
               }
             );
 
-            if (!prsResponse.data.values) {
-              return [];
+            if (prsResult.truncated) {
+              truncatedRepositories.push(repoSlug);
             }
 
             // Filter PRs where current user is a reviewer and hasn't approved
-            const reposPendingPRs = prsResponse.data.values.filter(
-              (pr: any) => {
-                if (!pr.participants || !Array.isArray(pr.participants)) {
-                  logger.debug(`PR ${pr.id} has no participants array`);
-                  return false;
-                }
-
-                logger.debug(
-                  `PR ${pr.id} participants:`,
-                  pr.participants.map((p: any) => ({
-                    nickname: p.user?.nickname,
-                    role: p.role,
-                    approved: p.approved,
-                  }))
-                );
-
-                // Check if current user is a reviewer who hasn't approved
-                const userParticipant = pr.participants.find(
-                  (participant: any) =>
-                    participant.user?.nickname === currentUserNickname &&
-                    participant.role === "REVIEWER" &&
-                    participant.approved === false
-                );
-
-                logger.debug(
-                  `PR ${pr.id} - User ${currentUserNickname} is pending reviewer:`,
-                  !!userParticipant
-                );
-
-                return !!userParticipant;
-              }
+            const reposPendingPRs = (prsResult.values as any[]).filter(
+              (pr: any) => isPendingReviewer(pr, currentUserNickname)
             );
 
             // Add repository info to each PR
@@ -3876,7 +3962,13 @@ class BitbucketServer {
               },
             }));
           } catch (error) {
+            // A failed repository used to be indistinguishable from one with
+            // nothing to review; report it instead.
             logger.error(`Error checking repository ${repoSlug}:`, error);
+            failedRepositories.push({
+              repository: repoSlug,
+              error: describeError(error),
+            });
             return [];
           }
         });
@@ -3884,31 +3976,18 @@ class BitbucketServer {
         // Wait for batch to complete
         const batchResults = await Promise.all(batchPromises);
 
-        // Flatten and add to results
         for (const repoPRs of batchResults) {
           pendingPRs.push(...repoPRs);
-
-          // Stop if we've reached the limit
-          if (pendingPRs.length >= limit) {
-            break;
-          }
-        }
-
-        // Stop processing if we've reached the limit
-        if (pendingPRs.length >= limit) {
-          break;
         }
       }
 
-      // Trim to exact limit and sort by updated date
-      const finalResults = pendingPRs
-        .slice(0, limit)
-        .sort(
-          (a, b) =>
-            new Date(b.updated_on).getTime() - new Date(a.updated_on).getTime()
-        );
+      // Rank across every repository before cutting to `limit` — the previous
+      // slice-then-sort produced an arbitrary subset in scan order.
+      const finalResults = rankPendingReviewPRs(pendingPRs, limit);
 
-      logger.info(`Found ${finalResults.length} pending review PRs`);
+      logger.info(
+        `Found ${pendingPRs.length} pending review PRs, returning ${finalResults.length}`
+      );
 
       return {
         content: [
@@ -3918,7 +3997,11 @@ class BitbucketServer {
               {
                 pending_review_prs: finalResults,
                 total_found: finalResults.length,
+                total_matched: pendingPRs.length,
+                limit_applied: pendingPRs.length > finalResults.length,
                 searched_repositories: repositoriesToCheck.length,
+                failed_repositories: failedRepositories,
+                truncated_repositories: truncatedRepositories,
                 user: currentUserNickname,
                 workspace: wsName,
               },
@@ -3933,7 +4016,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pending review PRs: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -3957,7 +4040,8 @@ class BitbucketServer {
     target_branch?: string,
     trigger_type?: "manual" | "push" | "pullrequest" | "schedule",
     legacyLimit?: number,
-    sort?: string
+    sort?: string,
+    maxItems?: number
   ) {
     try {
       logger.info("Listing pipeline runs", {
@@ -3983,9 +4067,13 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines`,
         {
-          pagelen: pagelen ?? legacyLimit,
-          page,
-          all,
+          ...resolvePagination({
+            pagelen,
+            page,
+            all,
+            limit: legacyLimit,
+            maxItems,
+          }),
           params,
           description: "listPipelineRuns",
         }
@@ -4001,7 +4089,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to list pipeline runs: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4041,7 +4129,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pipeline run: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4122,7 +4210,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to run pipeline: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4165,7 +4253,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to stop pipeline: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4177,7 +4265,8 @@ class BitbucketServer {
     pipeline_uuid: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting pipeline steps", {
@@ -4192,9 +4281,7 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps`,
         {
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({ pagelen, page, all, maxItems }),
           description: "getPipelineSteps",
         }
       );
@@ -4210,7 +4297,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pipeline steps: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4253,7 +4340,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pipeline step: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4398,7 +4485,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pipeline step logs: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4441,7 +4528,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request comment: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4485,7 +4572,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update pull request comment: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4523,7 +4610,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to delete pull request comment: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4616,7 +4703,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update comment resolved state: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4628,7 +4715,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting pull request diffstat", {
@@ -4643,9 +4731,7 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diffstat`,
         {
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({ pagelen, page, all, maxItems }),
           description: "getPullRequestDiffStat",
         }
       );
@@ -4661,7 +4747,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request diffstat: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4699,7 +4785,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request patch: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4713,7 +4799,8 @@ class BitbucketServer {
     page?: number,
     all?: boolean,
     q?: string,
-    sort?: string
+    sort?: string,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting pull request tasks", {
@@ -4733,9 +4820,7 @@ class BitbucketServer {
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
         {
           params: taskParams,
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({ pagelen, page, all, maxItems }),
           description: "getPullRequestTasks",
         }
       );
@@ -4751,7 +4836,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request tasks: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4796,7 +4881,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to create pull request task: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4834,7 +4919,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request task: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4878,7 +4963,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to update pull request task: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4914,7 +4999,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to delete pull request task: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }
@@ -4926,7 +5011,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    maxItems?: number
   ) {
     try {
       logger.info("Getting pull request statuses", {
@@ -4941,9 +5027,7 @@ class BitbucketServer {
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/statuses`,
         {
-          pagelen,
-          page,
-          all,
+          ...resolvePagination({ pagelen, page, all, maxItems }),
           description: "getPullRequestStatuses",
         }
       );
@@ -4959,7 +5043,7 @@ class BitbucketServer {
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pull request statuses: ${
-          error instanceof Error ? error.message : String(error)
+          describeError(error)
         }`
       );
     }

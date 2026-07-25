@@ -204,10 +204,16 @@ This MCP server provides tools for interacting with Bitbucket repositories and p
 
 Unless noted otherwise, listing tools accept the following optional parameters:
 
-- `pagelen`: Number of items per page (Bitbucket `pagelen`). Defaults to 10 and is capped at 100.
+- `pagelen`: Number of items per page (Bitbucket `pagelen`). Defaults to 10 and is capped at 100 — except `getPullRequests` and `getPullRequestActivity`, where Bitbucket answers `400 Invalid pagelen` above **50**, so those cap at 50.
 - `page`: 1-based Bitbucket page number to fetch. When omitted, the first page is returned.
-- `all`: When `true` (and `page` is not provided), the server automatically follows Bitbucket `next` links until all items are fetched or a safety cap of 1,000 entries is reached.
-- `limit`: Deprecated alias for `pagelen` kept for backward compatibility.
+- `all`: When `true` (and `page` is not provided), the server automatically follows Bitbucket `next` links until all items are fetched or `maxItems` is reached.
+- `maxItems`: Total number of items to return across pages. Defaults to the 1,000-entry safety cap when `all` is set.
+- `limit`: Deprecated alias for `maxItems`.
+
+`limit`/`maxItems` are a **total-item budget, not a page size**: `maxItems: 250`
+pages by 100 (or 50) and returns 250 items. It used to map straight onto
+`pagelen`, so `limit: 500` quietly returned 100 items — or a `400` once the
+value crossed Bitbucket's per-endpoint ceiling.
 
 Use these knobs to page through large collections without hitting CLI truncation.
 
@@ -236,6 +242,21 @@ always tell a complete result from a partial one:
 - `warning`: present when the request options were reinterpreted — for
   example passing `all` together with an explicit `page`, which returns that
   single page only.
+
+### Retries
+
+Read requests (`GET`/`HEAD`) that fail with `429`, `502`, `503` or `504` are
+retried up to 3 times, honouring `Retry-After` when present and falling back to
+capped exponential backoff with jitter. This matters most while following
+`next` links: a single rate-limit response used to discard every page already
+collected. Writes are never replayed — a retried `POST` could double-post a
+comment or approval.
+
+Set `BITBUCKET_MAX_RETRIES` to change the count, or `0` to disable.
+
+Failed requests now include Bitbucket's own explanation
+(`Request failed with status code 400: Invalid pagelen`) instead of the bare
+axios message.
 
 ### Filtering and sorting
 
@@ -441,6 +462,26 @@ Converts a regular pull request to draft status.
 - `workspace`: Bitbucket workspace name
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
+
+#### `getPendingReviewPRs`
+
+Finds open pull requests where the authenticated user is a reviewer who has
+not approved yet.
+
+**Parameters:**
+
+- `workspace` (optional): defaults to `BITBUCKET_WORKSPACE`
+- `repositoryList` (optional): repository slugs to scan; defaults to every repository in the workspace
+- `limit` (default 50): how many pull requests to return
+
+Because the reviewer filter runs client-side, the scan reads **all** open pull
+requests per repository (capped at 500) and ranks them by `updated_on` before
+cutting to `limit`. Repository identity comes from the slug, not the display
+name. The response reports what the scan could not cover:
+
+- `total_matched` vs `total_found` and `limit_applied` — how many matched before the cut
+- `failed_repositories` — repositories whose scan errored, with the reason
+- `truncated_repositories` — repositories with more than 500 open pull requests
 
 ### Pull Request Comment Operations
 

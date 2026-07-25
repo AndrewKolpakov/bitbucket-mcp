@@ -176,7 +176,33 @@ Cloud-модель (`page`/`pagelen`/`next`). У Server совсем друга�
 
 ---
 
-## 4. Предлагаемый план правок
+## 3.7 Найдено при реализации правок
+
+**Потолок `pagelen` различается по эндпойнтам.** `/pullrequests` и
+`/pullrequests/{id}/activity` отвечают `400 Invalid pagelen` на всё выше **50**;
+остальные коллекции принимают 100. В доке Atlassian этого нет — установлено
+пробами по живому API. Схема инструментов обещала `maximum: 100` для всех, то
+есть `getPullRequests` с `pagelen: 100` всегда падал с 400. Исправлено:
+`maxPagelen` задаётся per-endpoint.
+
+**Ошибки скрывали объяснение Bitbucket.** Все `catch` возвращали только
+`error.message` («Request failed with status code 400»), а тело ответа с
+причиной («Invalid pagelen») выбрасывалось. Добавлен `describeError`.
+
+**`getPipelineSteps` не объявлял пагинацию** — тот же класс бага, что и
+`getPullRequestTasks`: хендлер её поддерживал, схема нет, поэтому 16-шаговый
+пайплайн показывал 10 шагов. Исправлено.
+
+**`getPullRequestDiffStat` отвечает 400** («You may not have access to this
+repository…») при любом `pagelen` на репозитории, к которому доступ заведомо
+есть. Похоже на неверно собираемый путь; к пагинации отношения не имеет, не
+чинилось — отдельная задача.
+
+## 4. План правок
+
+Статус на 2026-07-25: **P0–P7 выполнены** на ветке
+`fix/pagination-metadata-and-sorting` форка `AndrewKolpakov/bitbucket-mcp`.
+Не сделано: поддержка Bitbucket Server (п. 3.3) и 400 у `diffstat` (п. 3.7).
 
 | # | Правка | Файл | Отдача / стоимость |
 | --- | --- | --- | --- |
