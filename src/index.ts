@@ -19,6 +19,7 @@ import {
   BITBUCKET_DEFAULT_PAGELEN,
   BITBUCKET_MAX_PAGELEN,
 } from "./pagination.js";
+import type { PaginatedValuesResult } from "./pagination.js";
 
 // =========== LOGGER SETUP ==========
 // File-based logging with sensible defaults and ability to disable
@@ -111,6 +112,54 @@ const LEGACY_LIMIT_SCHEMA = {
   description:
     "Deprecated alias for pagelen. Use pagelen/page/all for pagination control.",
 };
+
+/**
+ * Bitbucket's shared filter/sort query language, supported by most 2.0
+ * collections. See https://developer.atlassian.com/cloud/bitbucket/rest/intro/#filtering
+ * Only attached to endpoints where Atlassian documents support for it.
+ */
+const QUERY_SORT_SCHEMA = {
+  q: {
+    type: "string",
+    description:
+      'Bitbucket filter query, e.g. \'state="OPEN" AND author.nickname="jdoe"\'. Operators: = != ~ !~ > >= < <=, combined with AND/OR.',
+  },
+  sort: {
+    type: "string",
+    description:
+      "Field to sort by. Prefix with '-' for descending order, e.g. '-updated_on' for most recently updated first.",
+  },
+};
+
+/**
+ * Uniform response envelope for every paginated tool.
+ *
+ * Previously most tools returned a bare `values` array, so a caller could not
+ * tell "these are all the items" from "this is the first page of many" — the
+ * result silently looked complete. `hasMore`/`truncated` make that explicit.
+ */
+function paginatedContent<T>(result: PaginatedValuesResult<T>) {
+  const payload: Record<string, unknown> = {
+    values: result.values,
+    page: result.page,
+    pagelen: result.pagelen,
+    next: result.next,
+    previous: result.previous,
+    fetchedPages: result.fetchedPages,
+    totalFetched: result.totalFetched,
+    hasMore: Boolean(result.next),
+    truncated: result.truncated,
+  };
+  if (result.warning) {
+    payload.warning = result.warning;
+  }
+  if (result.truncated) {
+    payload.hint = `Result was capped at ${result.totalFetched} items. Narrow the query with q/sort, or page through with page/pagelen.`;
+  }
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+  };
+}
 
 // =========== TYPE DEFINITIONS ===========
 /**
@@ -588,9 +637,16 @@ class BitbucketServer {
               name: {
                 type: "string",
                 description:
-                  "Filter repositories by name (partial match supported)",
+                  "Filter repositories by name (partial match supported). Combined with `q` using AND when both are given.",
+              },
+              role: {
+                type: "string",
+                enum: ["member", "contributor", "admin", "owner"],
+                description:
+                  "Filter by the authenticated user's role on each repository.",
               },
               ...PAGINATION_BASE_SCHEMA,
+              ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
               limit: LEGACY_LIMIT_SCHEMA,
             },
@@ -628,6 +684,7 @@ class BitbucketServer {
                 description: "Pull request state",
               },
               ...PAGINATION_BASE_SCHEMA,
+              ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
               limit: LEGACY_LIMIT_SCHEMA,
             },
@@ -848,6 +905,7 @@ class BitbucketServer {
                 description: "Pull request ID",
               },
               ...PAGINATION_BASE_SCHEMA,
+              ...QUERY_SORT_SCHEMA,
               all: PAGINATION_ALL_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
@@ -1351,7 +1409,7 @@ class BitbucketServer {
               sort: {
                 type: "string",
                 description:
-                  "Field to sort by. Prefix with '-' for descending order. Supported fields: created_on, creator.uuid. Example: '-created_on' for newest first.",
+                  "Field to sort by. Prefix with '-' for descending order. Supported fields: created_on, creator.uuid. Defaults to '-created_on' (newest first); pass 'created_on' for the oldest runs.",
               },
             },
             required: ["workspace", "repo_slug"],
@@ -1733,6 +1791,11 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
+              // The handler has always accepted these; they were just missing
+              // from the schema, so callers could never reach past page 1.
+              ...PAGINATION_BASE_SCHEMA,
+              ...QUERY_SORT_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },
@@ -1901,7 +1964,10 @@ class BitbucketServer {
               args.page as number,
               args.all as boolean,
               args.name as string,
-              args.limit as number
+              args.limit as number,
+              args.q as string,
+              args.sort as string,
+              args.role as string
             );
           case "getRepository":
             return await this.getRepository(
@@ -1916,7 +1982,9 @@ class BitbucketServer {
               args.pagelen as number,
               args.page as number,
               args.all as boolean,
-              args.limit as number
+              args.limit as number,
+              args.q as string,
+              args.sort as string
             );
           case "createPullRequest":
             return await this.createPullRequest(
@@ -1986,7 +2054,9 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.q as string,
+              args.sort as string
             );
           case "getPullRequestDiff":
             return await this.getPullRequestDiff(
@@ -2226,7 +2296,9 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              args.q as string,
+              args.sort as string
             );
           case "createPullRequestTask":
             return await this.createPullRequestTask(
@@ -2301,7 +2373,10 @@ class BitbucketServer {
     page?: number,
     all?: boolean,
     name?: string,
-    legacyLimit?: number
+    legacyLimit?: number,
+    q?: string,
+    sort?: string,
+    role?: string
   ) {
     try {
       // Use default workspace if not provided
@@ -2323,9 +2398,21 @@ class BitbucketServer {
       });
 
       const params: Record<string, any> = {};
+      const filters: string[] = [];
       if (name) {
-        params.q = `name~"${name}"`;
+        // A quote or backslash in `name` used to leak into the query string
+        // and make Bitbucket reject the whole request with a 400.
+        const escaped = name.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        filters.push(`name~"${escaped}"`);
       }
+      if (q) {
+        filters.push(name ? `(${q})` : q);
+      }
+      if (filters.length > 0) {
+        params.q = filters.join(" AND ");
+      }
+      if (sort) params.sort = sort;
+      if (role) params.role = role;
 
       const repositories = await this.paginator.fetchValues<BitbucketRepository>(
         `/repositories/${wsName}`,
@@ -2338,14 +2425,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(repositories.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(repositories);
     } catch (error) {
       logger.error("Error listing repositories", { error, workspace, name });
       throw new McpError(
@@ -2428,7 +2508,9 @@ class BitbucketServer {
     pagelen?: number,
     page?: number,
     all?: boolean,
-    legacyLimit?: number
+    legacyLimit?: number,
+    q?: string,
+    sort?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull requests", {
@@ -2444,6 +2526,8 @@ class BitbucketServer {
       if (state) {
         params.state = state;
       }
+      if (q) params.q = q;
+      if (sort) params.sort = sort;
 
       const result = await this.paginator.fetchValues<BitbucketPullRequest>(
         `/repositories/${workspace}/${repo_slug}/pullrequests`,
@@ -2456,14 +2540,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull requests", {
         error,
@@ -2686,14 +2763,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull request activity", {
         error,
@@ -2893,7 +2963,9 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    q?: string,
+    sort?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull request comments", {
@@ -2905,24 +2977,22 @@ class BitbucketServer {
         all,
       });
 
+      const params: Record<string, any> = {};
+      if (q) params.q = q;
+      if (sort) params.sort = sort;
+
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         {
           pagelen,
           page,
           all,
+          params,
           description: "getPullRequestComments",
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull request comments", {
         error,
@@ -3023,14 +3093,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull request commits", {
         error,
@@ -3913,7 +3976,9 @@ class BitbucketServer {
       if (status) params.status = status;
       if (target_branch) params["target.branch"] = target_branch;
       if (trigger_type) params.trigger_type = trigger_type;
-      if (sort) params.sort = sort;
+      // Bitbucket returns pipelines oldest-first, so an unsorted call hands
+      // back the repository's very first builds — never what the caller wants.
+      params.sort = sort ?? "-created_on";
 
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines`,
@@ -3926,14 +3991,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error listing pipeline runs", {
         error,
@@ -4141,14 +4199,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result.values, null, 2),
-          },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pipeline steps", {
         error,
@@ -4599,11 +4650,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(result.values, null, 2) },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull request diffstat", {
         error,
@@ -4664,7 +4711,9 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    q?: string,
+    sort?: string
   ) {
     try {
       logger.info("Getting pull request tasks", {
@@ -4676,9 +4725,14 @@ class BitbucketServer {
         all,
       });
 
+      const taskParams: Record<string, any> = {};
+      if (q) taskParams.q = q;
+      if (sort) taskParams.sort = sort;
+
       const result = await this.paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
         {
+          params: taskParams,
           pagelen,
           page,
           all,
@@ -4686,11 +4740,7 @@ class BitbucketServer {
         }
       );
 
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(result.values, null, 2) },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull request tasks", {
         error,
@@ -4898,21 +4948,7 @@ class BitbucketServer {
         }
       );
 
-      const payload = {
-        values: result.values,
-        page: result.page,
-        pagelen: result.pagelen,
-        next: result.next,
-        previous: result.previous,
-        fetchedPages: result.fetchedPages,
-        totalFetched: result.totalFetched,
-      };
-
-      return {
-        content: [
-          { type: "text", text: JSON.stringify(payload, null, 2) },
-        ],
-      };
+      return paginatedContent(result);
     } catch (error) {
       logger.error("Error getting pull request statuses", {
         error,

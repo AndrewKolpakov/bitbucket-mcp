@@ -23,6 +23,14 @@ export interface PaginatedValuesResult<T> {
   fetchedPages: number;
   totalFetched: number;
   previous?: string;
+  /**
+   * True when more items exist on the server than were returned, because the
+   * `maxItems` cap was hit while following `next` links. Without this the
+   * caller cannot tell a complete result from a silently truncated one.
+   */
+  truncated: boolean;
+  /** Non-fatal note about how the request options were interpreted. */
+  warning?: string;
 }
 
 interface PendingRequestConfig {
@@ -62,6 +70,12 @@ export class BitbucketPaginator {
     }
 
     const shouldFetchAll = all === true && page === undefined;
+    // `all` combined with an explicit `page` silently returned a single page.
+    // Keep that behaviour (it is the safe one) but tell the caller about it.
+    const warning =
+      all === true && page !== undefined
+        ? "`all` was ignored because an explicit `page` was provided. Omit `page` to auto-follow next links."
+        : undefined;
     const requestDescriptor: PendingRequestConfig = {
       url: path,
       params: requestParams,
@@ -81,11 +95,14 @@ export class BitbucketPaginator {
         previous: response.data?.previous,
         fetchedPages: 1,
         totalFetched: values.length,
+        truncated: false,
+        warning,
       };
     }
 
     const aggregated: T[] = [];
     let fetchedPages = 0;
+    let lastNext: string | undefined;
     let nextRequest: PendingRequestConfig | undefined = requestDescriptor;
     let firstPageMeta: {
       page?: number;
@@ -109,8 +126,9 @@ export class BitbucketPaginator {
 
       const values = this.extractValues<T>(response.data);
       aggregated.push(...values);
+      lastNext = response.data?.next;
 
-      if (!response.data?.next) {
+      if (!lastNext) {
         nextRequest = undefined;
         break;
       }
@@ -131,8 +149,14 @@ export class BitbucketPaginator {
         totalFetched: aggregated.length,
       });
 
-      nextRequest = { url: response.data.next };
+      nextRequest = { url: lastNext };
     }
+
+    // Truncated either because the cap stopped us while the server still had a
+    // `next` link, or because the last page overshot the cap and got trimmed.
+    const truncated =
+      aggregated.length > maxItems ||
+      (aggregated.length >= maxItems && Boolean(lastNext));
 
     if (aggregated.length > maxItems) {
       aggregated.length = maxItems;
@@ -143,8 +167,13 @@ export class BitbucketPaginator {
       page: firstPageMeta.page,
       pagelen: firstPageMeta.pagelen,
       previous: firstPageMeta.previous,
+      // Surface the unfollowed link so the caller can resume instead of
+      // silently believing the collection ended here.
+      next: truncated ? lastNext : undefined,
       fetchedPages,
       totalFetched: aggregated.length,
+      truncated,
+      warning,
     };
   }
 

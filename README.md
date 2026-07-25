@@ -211,6 +211,50 @@ Unless noted otherwise, listing tools accept the following optional parameters:
 
 Use these knobs to page through large collections without hitting CLI truncation.
 
+#### Response shape
+
+Paginated tools return an envelope rather than a bare array, so a caller can
+always tell a complete result from a partial one:
+
+```json
+{
+  "values": [ ... ],
+  "page": 1,
+  "pagelen": 10,
+  "next": "https://api.bitbucket.org/2.0/...?page=2",
+  "previous": null,
+  "fetchedPages": 1,
+  "totalFetched": 10,
+  "hasMore": true,
+  "truncated": false
+}
+```
+
+- `hasMore`: more items exist on the server; re-request with `page`/`all`.
+- `truncated`: `true` when `all` stopped at the 1,000-item safety cap. The
+  `next` link is preserved so the collection can be resumed.
+- `warning`: present when the request options were reinterpreted — for
+  example passing `all` together with an explicit `page`, which returns that
+  single page only.
+
+### Filtering and sorting
+
+Endpoints that Atlassian documents as supporting the shared
+[filter/sort query language](https://developer.atlassian.com/cloud/bitbucket/rest/intro/#filtering)
+accept two extra parameters:
+
+- `q`: filter expression, e.g. `state="OPEN" AND author.nickname="jdoe"`
+- `sort`: field to sort by, `-` prefix for descending, e.g. `-updated_on`
+
+Currently wired for `listRepositories`, `getPullRequests`,
+`getPullRequestComments` and `getPullRequestTasks`.
+
+`listPipelineRuns` uses the pipelines-specific query parameters and takes
+`sort` only. It **defaults to `-created_on`** — Bitbucket returns pipelines
+oldest-first, so an unsorted call would hand back the repository's very first
+builds instead of the most recent ones. Pass `sort: "created_on"` for the old
+behaviour.
+
 ### Repository Operations
 
 #### `listRepositories`
@@ -220,8 +264,10 @@ Lists repositories in a workspace.
 **Parameters:**
 
 - `workspace` (optional): Bitbucket workspace name
-- `name` (optional): Filter repositories by partial name match
+- `name` (optional): Filter repositories by partial name match (combined with `q` using `AND` when both are given)
+- `role` (optional): `member` | `contributor` | `admin` | `owner`
 - Pagination controls described in [Pagination](#pagination)
+- `q` / `sort` described in [Filtering and sorting](#filtering-and-sorting)
 
 #### `getRepository`
 
