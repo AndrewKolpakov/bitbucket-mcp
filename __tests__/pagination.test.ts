@@ -136,6 +136,53 @@ describe("BitbucketPaginator", () => {
     expect(result.truncated).toBe(true);
   });
 
+  it("trims a single page that overshoots maxItems", async () => {
+    const axios = createMockAxios();
+    const logger = createMockLogger();
+    const paginator = new BitbucketPaginator(axios, logger);
+
+    // A server page bigger than the budget: happens with an explicit `page` (the
+    // page size is pinned) or on collections that ignore `pagelen`.
+    (axios.get as any).mockResolvedValue({
+      data: {
+        values: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }],
+        page: 2,
+        pagelen: 50,
+        next: "https://api.bitbucket.org/2.0/test?page=3",
+      },
+    });
+
+    const result = await paginator.fetchValues<{ id: number }>("/test", {
+      page: 2,
+      pagelen: 50,
+      maxItems: 2,
+    });
+
+    expect(result.values.map((item) => item.id)).toEqual([1, 2]);
+    expect(result.totalFetched).toBe(2);
+    expect(result.truncated).toBe(true);
+    // The caller must be told that `next` skips past the trimmed items.
+    expect(result.warning).toMatch(/trimmed this page from 4 items/);
+  });
+
+  it("leaves a page that fits the budget untouched and unflagged", async () => {
+    const axios = createMockAxios();
+    const logger = createMockLogger();
+    const paginator = new BitbucketPaginator(axios, logger);
+
+    (axios.get as any).mockResolvedValue({
+      data: { values: [{ id: 1 }, { id: 2 }], page: 1, pagelen: 10 },
+    });
+
+    const result = await paginator.fetchValues<{ id: number }>("/test", {
+      maxItems: 5,
+    });
+
+    expect(result.values).toHaveLength(2);
+    expect(result.truncated).toBe(false);
+    expect(result.warning).toBeUndefined();
+  });
+
   it("warns instead of silently ignoring all when page is also given", async () => {
     const axios = createMockAxios();
     const logger = createMockLogger();

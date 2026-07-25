@@ -33,8 +33,9 @@ export interface PaginatedValuesResult<T> {
   previous?: string;
   /**
    * True when more items exist on the server than were returned, because the
-   * `maxItems` cap was hit while following `next` links. Without this the
-   * caller cannot tell a complete result from a silently truncated one.
+   * `maxItems` cap was hit — either while following `next` links or by trimming
+   * a single over-long page. Without this the caller cannot tell a complete
+   * result from a silently truncated one.
    */
   truncated: boolean;
   /** Non-fatal note about how the request options were interpreted. */
@@ -84,12 +85,26 @@ export function resolvePagination(args: PaginationArgs): ResolvedPagination {
   } = args;
   const budget = maxItems ?? limit;
 
+  const explicitPagelen =
+    pagelen !== undefined ? Math.min(pagelen, maxPagelen) : undefined;
+  const budgetPagelen =
+    budget !== undefined && budget > 0
+      ? Math.min(budget, maxPagelen)
+      : undefined;
+
+  // Never ask Bitbucket for a page bigger than the budget can keep: passing both
+  // `pagelen: 100` and `maxItems: 3` used to fetch (and return) a full 100-item
+  // page, because the budget only ever gated page-following.
+  //
+  // An explicit `page` is the exception — there the page size fixes the window,
+  // so shrinking it would hand back a different slice of the collection than the
+  // caller asked for. The budget is enforced by trimming in `fetchValues`.
   const resolvedPagelen =
-    pagelen !== undefined
-      ? Math.min(pagelen, maxPagelen)
-      : budget !== undefined && budget > 0
-        ? Math.min(budget, maxPagelen)
-        : undefined;
+    explicitPagelen === undefined
+      ? budgetPagelen
+      : page === undefined && budgetPagelen !== undefined
+        ? Math.min(explicitPagelen, budgetPagelen)
+        : explicitPagelen;
 
   const effectivePagelen = resolvedPagelen ?? BITBUCKET_DEFAULT_PAGELEN;
   // An explicit `all` always wins; otherwise a budget larger than one page
@@ -160,16 +175,31 @@ export class BitbucketPaginator {
         description
       );
       const values = this.extractValues<T>(response.data);
+      // The budget has to be enforced here too, not just while following `next`
+      // links: with an explicit `page` the page size is pinned, and some
+      // collections ignore `pagelen` outright, so a page can still overshoot.
+      // Until this existed, `maxItems: 3` on a 50-item page returned all 50.
+      const trimmed = values.length > maxItems;
+      const capped = trimmed ? values.slice(0, maxItems) : values;
+      const notes = warning ? [warning] : [];
+      if (trimmed) {
+        // `next` is the server's link to the page *after* this one, so resuming
+        // from it would skip whatever the trim dropped. Say so rather than let
+        // the caller stitch together a collection with a hole in it.
+        notes.push(
+          `\`maxItems\` (${maxItems}) trimmed this page from ${values.length} items; \`next\` starts at the following page, so resuming there would skip the trimmed items. Raise maxItems, or page through with pagelen instead.`
+        );
+      }
       return {
-        values,
+        values: capped,
         page: response.data?.page ?? page,
         pagelen: response.data?.pagelen ?? resolvedPagelen,
         next: response.data?.next,
         previous: response.data?.previous,
         fetchedPages: 1,
-        totalFetched: values.length,
-        truncated: false,
-        warning,
+        totalFetched: capped.length,
+        truncated: trimmed,
+        warning: notes.length ? notes.join(" ") : undefined,
       };
     }
 

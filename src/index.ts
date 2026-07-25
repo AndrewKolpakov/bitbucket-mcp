@@ -23,6 +23,7 @@ import {
 import { resolvePagination } from "./pagination.js";
 import type { PaginatedValuesResult } from "./pagination.js";
 import { attachRetryInterceptor, DEFAULT_MAX_RETRIES } from "./retry.js";
+import { buildAuthHeaders } from "./auth.js";
 import {
   isPendingReviewer,
   rankPendingReviewPRs,
@@ -42,7 +43,9 @@ const MAX_OPEN_PRS_PER_REPOSITORY = 500;
  */
 function describeError(error: unknown): string {
   if (!axios.isAxiosError(error)) {
-    return describeError(error);
+    // This used to recurse into itself, so any non-Axios throw (a TypeError in a
+    // handler, an aborted stream) blew the stack instead of being reported.
+    return error instanceof Error ? error.message : String(error);
   }
   const data: any = error.response?.data;
   const detail =
@@ -158,7 +161,7 @@ const PAGINATION_ALL_SCHEMA = {
 const PAGINATION_MAX_ITEMS_SCHEMA = {
   type: "number",
   minimum: 1,
-  description: `Total number of items to return across pages. Pages are followed automatically until this budget is spent. Defaults to ${BITBUCKET_ALL_ITEMS_CAP} when 'all' is set.`,
+  description: `Hard cap on how many items come back: pages are followed until the budget is spent, and a page longer than the budget is trimmed to it. Defaults to ${BITBUCKET_ALL_ITEMS_CAP} when 'all' is set.`,
 };
 
 const LEGACY_LIMIT_SCHEMA = {
@@ -651,18 +654,12 @@ class BitbucketServer {
       );
     }
 
-    // Setup Axios instance
-    const headers: Record<string, string> = {};
-    if (this.config.token) {
-      headers.Authorization = `Bearer ${this.config.token}`;
-    }
+    // Setup Axios instance. Credentials go in a header — never in axios's `auth`
+    // option, which does not survive Bitbucket's diff/diffstat redirects. See
+    // buildAuthHeaders.
     this.api = axios.create({
       baseURL: this.config.baseUrl,
-      headers,
-      auth:
-        this.config.username && this.config.password
-          ? { username: this.config.username, password: this.config.password }
-          : undefined,
+      headers: buildAuthHeaders(this.config),
     });
 
     // Retry transient failures on reads. Following `next` links can fire ten
@@ -1816,7 +1813,8 @@ class BitbucketServer {
         },
         {
           name: "getPullRequestDiffStat",
-          description: "Get diff statistics for a pull request",
+          description:
+            "Get diff statistics (per-file added/removed line counts) for a pull request",
           inputSchema: {
             type: "object",
             properties: {
@@ -1829,6 +1827,13 @@ class BitbucketServer {
                 type: "string",
                 description: "Pull request ID",
               },
+              // Same gap as getPipelineSteps: the handler has always paginated,
+              // the schema did not say so, so every pagination argument was
+              // dropped before it reached the call site and a big PR silently
+              // reported only its first 10 files.
+              ...paginationBaseSchema(),
+              all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
           },

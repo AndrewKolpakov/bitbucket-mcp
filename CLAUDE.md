@@ -40,7 +40,10 @@ npm run release         # Alias for publish:patch
 ## Architecture
 
 ### Single-File Design
-The entire server implementation lives in `src/index.ts` (~4,500 lines). This includes:
+Most of the server lives in `src/index.ts` (~4,500 lines), with a few concerns
+extracted into modules: `src/pagination.ts` (page-following + budget),
+`src/retry.ts` (429/5xx backoff), `src/pending-review.ts`, `src/auth.ts`.
+`index.ts` includes:
 - Type definitions for Bitbucket API entities
 - BitbucketClient class with all API methods
 - MCP server setup and tool registration
@@ -91,6 +94,15 @@ Supports two methods (checked in order):
 
 Note: `BITBUCKET_USERNAME` is typically your email address for Bitbucket Cloud.
 
+**Do not move credentials back into axios's `auth` option.** `buildAuthHeaders`
+(`src/auth.ts`) deliberately builds an `Authorization` header for both forms:
+axios turns `auth` into Node's `options.auth`, which `follow-redirects` does not
+replay on a redirect. Bitbucket `302`s the pull-request diff/diffstat endpoints
+onto `/repositories/{ws}/{slug}/diffstat/{revspec}`, so with `auth` the followed
+request went out anonymous and returned `404 You may not have access to this
+repository`. Header form is also safe: the redirect follower strips
+`authorization` once a redirect leaves the host.
+
 ### Inline PR Comments
 Uses special inline parameter format:
 ```typescript
@@ -135,4 +147,4 @@ MCP clients (like Cursor) communicate via stdio transport using the MCP protocol
 - All API responses are returned as JSON-stringified text content in MCP format
 - Error handling uses McpError with appropriate ErrorCodes
 - Logger writes structured JSON logs (not console output, which would break stdio transport)
-- No test files currently exist in the repository
+- Jest tests live in `__tests__/` (pagination, budget resolution, retry, pending review, auth headers); `npm run lint` is currently broken upstream — the repo ships no ESLint config

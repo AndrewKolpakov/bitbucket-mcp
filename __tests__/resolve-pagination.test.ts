@@ -41,6 +41,30 @@ describe("resolvePagination", () => {
     });
   });
 
+  it("shrinks an explicit pagelen that overshoots the budget", () => {
+    // `pagelen: 100, maxItems: 3` used to fetch and return a full 100-item page:
+    // the budget only gated page-following, so it never applied to a single page.
+    expect(resolvePagination({ pagelen: 100, maxItems: 3 })).toEqual({
+      pagelen: 3,
+      page: undefined,
+      all: undefined,
+      maxItems: 3,
+      maxPagelen: 100,
+    });
+  });
+
+  it("keeps the requested pagelen when an explicit page pins the window", () => {
+    // Shrinking pagelen here would return a different slice than page 2 of 50.
+    // The budget is enforced by trimming in the paginator instead.
+    expect(resolvePagination({ pagelen: 50, page: 2, maxItems: 3 })).toEqual({
+      pagelen: 50,
+      page: 2,
+      all: undefined,
+      maxItems: 3,
+      maxPagelen: 100,
+    });
+  });
+
   it("does not auto-follow pages when an explicit page is requested", () => {
     expect(resolvePagination({ limit: 500, page: 3 })).toEqual({
       pagelen: 100,

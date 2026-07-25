@@ -108,6 +108,12 @@ Configure the server using the following environment variables:
 
 Either `BITBUCKET_TOKEN` or both `BITBUCKET_USERNAME` and `BITBUCKET_PASSWORD` must be provided.
 
+Both forms are sent as an `Authorization` header rather than through axios's
+`auth` option, because Bitbucket redirects some endpoints (notably the
+pull-request diff/diffstat pair) and only headers are replayed across a redirect
+— see `src/auth.ts`. Credentials are not leaked off-host: the redirect follower
+drops `authorization` as soon as a redirect leaves the Bitbucket host.
+
 ### Creating a Bitbucket App Password
 
 1. Log in to your Bitbucket account
@@ -207,13 +213,20 @@ Unless noted otherwise, listing tools accept the following optional parameters:
 - `pagelen`: Number of items per page (Bitbucket `pagelen`). Defaults to 10 and is capped at 100 — except `getPullRequests` and `getPullRequestActivity`, where Bitbucket answers `400 Invalid pagelen` above **50**, so those cap at 50.
 - `page`: 1-based Bitbucket page number to fetch. When omitted, the first page is returned.
 - `all`: When `true` (and `page` is not provided), the server automatically follows Bitbucket `next` links until all items are fetched or `maxItems` is reached.
-- `maxItems`: Total number of items to return across pages. Defaults to the 1,000-entry safety cap when `all` is set.
+- `maxItems`: Hard cap on how many items come back, across pages. Defaults to the 1,000-entry safety cap when `all` is set.
 - `limit`: Deprecated alias for `maxItems`.
 
 `limit`/`maxItems` are a **total-item budget, not a page size**: `maxItems: 250`
 pages by 100 (or 50) and returns 250 items. It used to map straight onto
 `pagelen`, so `limit: 500` quietly returned 100 items — or a `400` once the
 value crossed Bitbucket's per-endpoint ceiling.
+
+The budget is also a real ceiling on the response, not just on page-following:
+a budget below one page shrinks the requested `pagelen` (so `pagelen: 100` with
+`maxItems: 3` fetches 3 items, not 100), and a page that still overshoots — an
+explicit `page` pins the page size, and some collections ignore `pagelen` — is
+trimmed to the budget with `truncated: true` and a `warning` explaining that
+`next` starts after the trimmed items.
 
 Use these knobs to page through large collections without hitting CLI truncation.
 
@@ -609,13 +622,19 @@ Gets the diff for a pull request.
 
 #### `getPullRequestDiffStat`
 
-Gets the diff statistics for a pull request.
+Gets the diff statistics (per-file added/removed line counts) for a pull request.
+
+Bitbucket answers this endpoint with a `302` onto
+`/repositories/{workspace}/{repo_slug}/diffstat/{revspec}`, so the credentials
+have to survive the redirect (they are sent as an `Authorization` header for
+exactly this reason).
 
 **Parameters:**
 
 - `workspace`: Bitbucket workspace name
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
+- Pagination: `pagelen`, `page`, `all`, `maxItems` (a large PR paginates by file)
 
 #### `getPullRequestPatch`
 

@@ -193,16 +193,56 @@ Cloud-модель (`page`/`pagelen`/`next`). У Server совсем друга�
 `getPullRequestTasks`: хендлер её поддерживал, схема нет, поэтому 16-шаговый
 пайплайн показывал 10 шагов. Исправлено.
 
-**`getPullRequestDiffStat` отвечает 400** («You may not have access to this
-repository…») при любом `pagelen` на репозитории, к которому доступ заведомо
-есть. Похоже на неверно собираемый путь; к пагинации отношения не имеет, не
-чинилось — отдельная задача.
+**`getPullRequestDiffStat` отвечал 404/400** («You may not have access to this
+repository…») на репозитории, к которому доступ заведомо есть. **Причина найдена
+и исправлена (2026-07-25).** Путь был правильный: Bitbucket отвечает на
+`/pullrequests/{id}/diffstat` редиректом `302` на
+`/repositories/{ws}/{slug}/diffstat/{revspec}` (док подтверждает: «redirects to
+the repository diffstat with the revspec»). Креды передавались через опцию axios
+`auth`, которая превращается в `options.auth` Node, а `follow-redirects` её на
+переходе не воспроизводит — переносятся только заголовки. Итог: запрос по
+редиректу уходил анонимным и получал 404, который читался как «нет доступа к
+репозиторию».
+
+Пробы по живому API (PR 51, `managegocom/ai-chat`):
+
+| запрос | результат |
+| --- | --- |
+| `/pullrequests/51/diffstat`, redirect=manual | `302` → `/repositories/…/diffstat/…:eea36f8%0Df379fe7?from_pullrequest_id=51&topic=true` |
+| цель редиректа с авторизацией | `200`, `values: 3` |
+| цель редиректа без авторизации | `404 You may not have access to this repository…` — тот самый текст |
+| axios с `auth:` (как было) | `404` |
+| axios с заголовком `Authorization` | `200`, `pagelen` учтён |
+
+Исправлено в `src/auth.ts` (`buildAuthHeaders`): и Basic, и Bearer уходят
+заголовком. Лечит все редиректящие эндпойнты, не только `diffstat`. Утечки кредов
+нет: `follow-redirects` 1.15.9 срезает `authorization` при уходе с хоста
+(`!isSubdomain(redirectUrl.host, currentHost)`).
+
+Заодно у `getPullRequestDiffStat` не была объявлена пагинация в схеме (call-site
+её уже передавал) — тот же класс бага, что у `getPipelineSteps`. Добавлена.
+
+**`maxItems` не ограничивал объём ответа.** Бюджет был только условием остановки
+обхода `next` (`while (nextRequest && aggregated.length < maxItems)`), а на
+одностраничном пути игнорировался вовсе, и `resolvePagination` выводил размер
+страницы из бюджета лишь когда `pagelen` не задан. Поэтому
+`getPullRequests(pagelen: 100, maxItems: 3)` возвращал 50 PR (665 КБ, вылет за
+лимит вывода клиента). Исправлено с двух сторон: бюджет ниже страницы сжимает
+запрашиваемый `pagelen`, а страница, которая всё равно переполнена (явный `page`
+фиксирует окно; часть коллекций игнорирует `pagelen`), обрезается с
+`truncated: true` и `warning` о том, что `next` начинается после обрезанного.
+
+**`describeError` рекурсировал в себя** на не-axios ошибках
+(`if (!isAxiosError) return describeError(error)`), то есть любой посторонний
+throw давал переполнение стека вместо сообщения. Исправлено.
 
 ## 4. План правок
 
 Статус на 2026-07-25: **P0–P7 выполнены** на ветке
 `fix/pagination-metadata-and-sorting` форка `AndrewKolpakov/bitbucket-mcp`.
-Не сделано: поддержка Bitbucket Server (п. 3.3) и 400 у `diffstat` (п. 3.7).
+Вторым проходом в тот же день закрыты `diffstat` (редирект терял авторизацию),
+`maxItems` как реальный кап объёма и рекурсия в `describeError` — все три
+проверены по живому API. Не сделано: поддержка Bitbucket Server (п. 3.3).
 
 | # | Правка | Файл | Отдача / стоимость |
 | --- | --- | --- | --- |
