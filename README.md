@@ -418,7 +418,9 @@ Merges a pull request.
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
 - `message` (optional): Merge commit message
-- `strategy` (optional): Merge strategy (`merge-commit`, `squash`, `fast-forward`)
+- `strategy` (optional): Merge strategy (`merge_commit`, `squash`, `fast_forward`).
+  The hyphenated aliases `merge-commit` / `fast-forward` are accepted and normalized;
+  anything else is rejected with `InvalidParams` instead of reaching Bitbucket.
 
 #### `requestChanges`
 

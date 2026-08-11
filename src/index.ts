@@ -24,6 +24,8 @@ import { resolvePagination } from "./pagination.js";
 import type { PaginatedValuesResult } from "./pagination.js";
 import { attachRetryInterceptor, DEFAULT_MAX_RETRIES } from "./retry.js";
 import { buildAuthHeaders } from "./auth.js";
+import { normalizeMergeStrategy } from "./merge-strategy.js";
+import type { MergeStrategy } from "./merge-strategy.js";
 import {
   isPendingReviewer,
   rankPendingReviewPRs,
@@ -946,8 +948,9 @@ class BitbucketServer {
               message: { type: "string", description: "Merge commit message" },
               strategy: {
                 type: "string",
-                enum: ["merge-commit", "squash", "fast-forward"],
-                description: "Merge strategy",
+                enum: ["merge_commit", "squash", "fast_forward"],
+                description:
+                  "Merge strategy. Hyphenated aliases (merge-commit, fast-forward) are also accepted",
               },
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
@@ -2130,7 +2133,7 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.message as string,
-              args.strategy as "merge-commit" | "squash" | "fast-forward"
+              args.strategy as string | undefined
             );
           case "getPullRequestComments":
             return await this.getPullRequestComments(
@@ -3021,20 +3024,29 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     message?: string,
-    strategy?: "merge-commit" | "squash" | "fast-forward"
+    strategy?: string
   ) {
+    // Bitbucket wants merge_commit / squash / fast_forward; older callers may
+    // still send the hyphenated spelling this server used to advertise.
+    let mergeStrategy: MergeStrategy | undefined;
+    try {
+      mergeStrategy = normalizeMergeStrategy(strategy);
+    } catch (error) {
+      throw new McpError(ErrorCode.InvalidParams, describeError(error));
+    }
+
     try {
       logger.info("Merging Bitbucket pull request", {
         workspace,
         repo_slug,
         pull_request_id,
-        strategy,
+        strategy: mergeStrategy,
       });
 
       // Build request data
       const data: Record<string, any> = {};
       if (message) data.message = message;
-      if (strategy) data.merge_strategy = strategy;
+      if (mergeStrategy) data.merge_strategy = mergeStrategy;
 
       const response = await this.api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge`,
