@@ -1,0 +1,15 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "local-bitbucket",
+  "owner": {
+    "name": "Andrew Kolpakov"
+  },
+  "description": "Bitbucket over MCP. A fork of https://github.com/MatanYemini/bitbucket-mcp, packaged as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "bitbucket-mcp",
+      "source": "./",
+      "description": "Bitbucket Cloud and Server over MCP, with pagination metadata, sorting and retries. Forked from https://github.com/MatanYemini/bitbucket-mcp."
+    }
+  ]
+}

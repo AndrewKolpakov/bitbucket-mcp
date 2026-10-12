@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "bitbucket": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/plugin/scripts/bitbucket_mcp_launcher.mjs"
+      ],
+      "env": {
+        "BITBUCKET_URL": "${user_config.bitbucket_url}",
+        "BITBUCKET_WORKSPACE": "${user_config.bitbucket_workspace}",
+        "BITBUCKET_USERNAME": "${user_config.bitbucket_username}",
+        "BITBUCKET_PASSWORD": "${user_config.bitbucket_password}",
+        "BITBUCKET_TOKEN": "${user_config.bitbucket_token}",
+        "BITBUCKET_MCP_DIR": "${user_config.server_source}"
+      }
+    }
+  }
+}

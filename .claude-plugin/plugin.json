@@ -1,0 +1,54 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "bitbucket-mcp",
+  "displayName": "MCP Bitbucket",
+  "version": "0.1.0",
+  "description": "Bitbucket repositories, pull requests, comments and pipelines over MCP, with pagination metadata, sorting and retries. Reads the same credentials file as the mcp-atlassian plugin.",
+  "author": {
+    "name": "Andrew Kolpakov",
+    "email": "andrew.kolpakov@gmail.com"
+  },
+  "repository": "https://github.com/AndrewKolpakov/bitbucket-mcp",
+  "license": "MIT",
+  "keywords": [
+    "bitbucket",
+    "pull-requests",
+    "pipelines",
+    "atlassian",
+    "mcp"
+  ],
+  "userConfig": {
+    "bitbucket_url": {
+      "type": "string",
+      "title": "Bitbucket API URL",
+      "description": "Leave empty for Bitbucket Cloud (https://api.bitbucket.org/2.0). For Server/DC, the REST base URL of your instance."
+    },
+    "bitbucket_workspace": {
+      "type": "string",
+      "title": "Default workspace",
+      "description": "The workspace tools use when a call names none, e.g. your-company."
+    },
+    "bitbucket_username": {
+      "type": "string",
+      "title": "Account email",
+      "description": "The Atlassian account email the API token belongs to. Leave empty when using an access token."
+    },
+    "bitbucket_password": {
+      "type": "string",
+      "title": "API token (with account email)",
+      "description": "An Atlassian API token with Bitbucket scopes, used together with the account email.",
+      "sensitive": true
+    },
+    "bitbucket_token": {
+      "type": "string",
+      "title": "Access token (bearer)",
+      "description": "Alternative to email + API token: a workspace, project or repository access token, sent as a bearer token.",
+      "sensitive": true
+    },
+    "server_source": {
+      "type": "directory",
+      "title": "Run from this checkout instead",
+      "description": "Optional. Point this at a built clone of the repository to run that working tree rather than the copy shipped with the plugin. Equivalent to setting BITBUCKET_MCP_DIR."
+    }
+  }
+}
