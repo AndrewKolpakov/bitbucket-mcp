@@ -1,7 +1,15 @@
+/**
+ * Every `merge_strategy` value the Bitbucket Cloud merge endpoint accepts
+ * (pullrequest_merge_parameters in the official OpenAPI spec). Merge queues
+ * only take `merge_commit`, `squash` and `rebase_merge`.
+ */
 export const MERGE_STRATEGIES = [
   "merge_commit",
   "squash",
   "fast_forward",
+  "squash_fast_forward",
+  "rebase_fast_forward",
+  "rebase_merge",
 ] as const;
 
 export type MergeStrategy = (typeof MERGE_STRATEGIES)[number];
@@ -9,8 +17,8 @@ export type MergeStrategy = (typeof MERGE_STRATEGIES)[number];
 /**
  * Normalize a caller-supplied merge strategy to what Bitbucket accepts.
  *
- * The Bitbucket Cloud merge endpoint validates `merge_strategy` against
- * `merge_commit` / `squash` / `fast_forward` (underscores). This server used to
+ * The Bitbucket Cloud merge endpoint validates `merge_strategy` against the
+ * underscore spellings in MERGE_STRATEGIES. This server used to
  * advertise the hyphenated spellings in its tool schema and passed them through
  * untouched, so every merge with an explicit strategy came back
  * `400 ... "merge-commit" is not one of the available choices`.

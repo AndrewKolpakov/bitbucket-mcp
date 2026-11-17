@@ -24,7 +24,7 @@ import { PaginationPendingError, resolvePagination } from "./pagination.js";
 import type { PaginatedValuesResult } from "./pagination.js";
 import { attachRetryInterceptor, DEFAULT_MAX_RETRIES } from "./retry.js";
 import { buildAuthHeaders } from "./auth.js";
-import { normalizeMergeStrategy } from "./merge-strategy.js";
+import { MERGE_STRATEGIES, normalizeMergeStrategy } from "./merge-strategy.js";
 import type { MergeStrategy } from "./merge-strategy.js";
 import {
   buildMergeBody,
@@ -1115,9 +1115,9 @@ class BitbucketServer {
               message: { type: "string", description: "Merge commit message" },
               strategy: {
                 type: "string",
-                enum: ["merge_commit", "squash", "fast_forward"],
+                enum: [...MERGE_STRATEGIES],
                 description:
-                  "Merge strategy. Hyphenated aliases (merge-commit, fast-forward) are also accepted",
+                  "Merge strategy. Hyphenated aliases (e.g. merge-commit, rebase-merge) are also accepted. A destination branch with a merge queue only takes merge_commit, squash and rebase_merge",
               },
               closeSourceBranch: {
                 type: "boolean",
@@ -3610,7 +3610,7 @@ class BitbucketServer {
     closeSourceBranch?: boolean,
     asyncMerge?: boolean
   ) {
-    // Bitbucket wants merge_commit / squash / fast_forward; older callers may
+    // Bitbucket wants the underscore spellings in MERGE_STRATEGIES; older callers may
     // still send the hyphenated spelling this server used to advertise.
     let mergeStrategy: MergeStrategy | undefined;
     try {

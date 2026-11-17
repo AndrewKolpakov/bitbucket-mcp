@@ -425,8 +425,10 @@ Merges a pull request.
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
 - `message` (optional): Merge commit message
-- `strategy` (optional): Merge strategy (`merge_commit`, `squash`, `fast_forward`).
-  The hyphenated aliases `merge-commit` / `fast-forward` are accepted and normalized;
+- `strategy` (optional): Merge strategy (`merge_commit`, `squash`, `fast_forward`,
+  `squash_fast_forward`, `rebase_fast_forward`, `rebase_merge`). A destination branch with a
+  merge queue only takes `merge_commit`, `squash` and `rebase_merge`.
+  Hyphenated aliases (`merge-commit`, `rebase-merge`, ...) are accepted and normalized;
   anything else is rejected with `InvalidParams` instead of reaching Bitbucket.
 - `closeSourceBranch` (optional): Close the source branch after merge. If omitted, Bitbucket uses the value set at creation; `false` is sent as-is
 - `async` (optional): Merge asynchronously. When Bitbucket answers `202` (always with `async: true`, also for slow merges and merge queues) the tool returns `{ status: "PENDING", task_id, task_status_url, message }`; poll `getPullRequestMergeTaskStatus`

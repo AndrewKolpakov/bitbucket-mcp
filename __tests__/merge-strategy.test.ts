@@ -12,6 +12,17 @@ describe("normalizeMergeStrategy", () => {
     expect(normalizeMergeStrategy("fast_forward")).toBe("fast_forward");
   });
 
+  it("accepts every strategy Bitbucket lists, with hyphenated aliases", () => {
+    for (const strategy of [
+      "squash_fast_forward",
+      "rebase_fast_forward",
+      "rebase_merge",
+    ]) {
+      expect(normalizeMergeStrategy(strategy)).toBe(strategy);
+      expect(normalizeMergeStrategy(strategy.replace(/_/g, "-"))).toBe(strategy);
+    }
+  });
+
   it("tolerates case and surrounding whitespace", () => {
     expect(normalizeMergeStrategy(" Merge-Commit ")).toBe("merge_commit");
   });

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `mergePullRequest` accepts the remaining Bitbucket merge strategies: `squash_fast_forward`, `rebase_fast_forward` and `rebase_merge` (hyphenated aliases too). They were rejected with `InvalidParams` before.
 - Added `requestChangesPullRequest` and `unrequestChangesPullRequest` (POST/DELETE `.../request-changes`).
 - `updatePullRequest` now accepts `destinationBranch`, `closeSourceBranch`, and reviewer changes via `reviewers` (full replacement, `[]` clears), `addReviewers` and `removeReviewers` (ids as `{uuid}`, bare uuid or Atlassian account_id). Add/remove read the current reviewers first and always send the full list; a removal that matches no current reviewer is rejected instead of silently ignored. Invalid input returns `InvalidParams`.
 - `mergePullRequest` now accepts `closeSourceBranch` and `async`; a `202` response is returned as `{ status: "PENDING", task_id, task_status_url }`. Added `getPullRequestMergeTaskStatus`.
