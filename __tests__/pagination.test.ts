@@ -1,6 +1,10 @@
 import { jest } from "@jest/globals";
 import type { AxiosInstance } from "axios";
-import { BitbucketPaginator, BITBUCKET_MAX_PAGELEN } from "../src/pagination.js";
+import {
+  BitbucketPaginator,
+  BITBUCKET_MAX_PAGELEN,
+  PaginationPendingError,
+} from "../src/pagination.js";
 
 const createMockAxios = () => {
   return {
@@ -13,6 +17,45 @@ const createMockLogger = () => ({
 }) as any;
 
 describe("BitbucketPaginator", () => {
+  describe("rejectAccepted", () => {
+    it("throws PaginationPendingError when the first page answers 202", async () => {
+      const axios = createMockAxios();
+      const paginator = new BitbucketPaginator(axios, createMockLogger());
+      (axios.get as any).mockResolvedValue({ status: 202, data: "" });
+
+      await expect(
+        paginator.fetchValues("/commit/abc/pullrequests", { rejectAccepted: true })
+      ).rejects.toMatchObject({ name: "PaginationPendingError", fetchedPages: 0 });
+    });
+
+    it("throws when a later page answers 202 while following next links", async () => {
+      const axios = createMockAxios();
+      const paginator = new BitbucketPaginator(axios, createMockLogger());
+      (axios.get as any)
+        .mockResolvedValueOnce({
+          status: 200,
+          data: { values: [{ id: 1 }], next: "https://api/next?page=2" },
+        })
+        .mockResolvedValueOnce({ status: 202, data: "" });
+
+      const error = await paginator
+        .fetchValues("/commit/abc/pullrequests", { all: true, rejectAccepted: true })
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(PaginationPendingError);
+      expect(error.fetchedPages).toBe(1);
+      expect(error.url).toBe("https://api/next?page=2");
+    });
+
+    it("keeps reading a 202 as a page when the option is off", async () => {
+      const axios = createMockAxios();
+      const paginator = new BitbucketPaginator(axios, createMockLogger());
+      (axios.get as any).mockResolvedValue({ status: 202, data: "" });
+
+      const result = await paginator.fetchValues("/other");
+      expect(result.values).toEqual([]);
+    });
+  });
+
   it("respects pagelen and page arguments", async () => {
     const axios = createMockAxios();
     const logger = createMockLogger();

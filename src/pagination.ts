@@ -21,6 +21,22 @@ export interface PaginationRequestOptions {
   maxPagelen?: number;
   maxItems?: number;
   description?: string;
+  /**
+   * Throw `PaginationPendingError` when any page answers `202 Accepted`.
+   * Some collections (pull requests for a commit) answer 202 with an empty
+   * body while Bitbucket is still indexing; read as a page, that becomes a
+   * silent "no results". Off by default so other endpoints keep their
+   * behaviour.
+   */
+  rejectAccepted?: boolean;
+}
+
+/** A page answered `202 Accepted`: the collection is not ready yet. */
+export class PaginationPendingError extends Error {
+  constructor(readonly url: string, readonly fetchedPages: number) {
+    super(`Bitbucket answered 202 (not ready yet) for ${url}`);
+    this.name = "PaginationPendingError";
+  }
 }
 
 export interface PaginatedValuesResult<T> {
@@ -143,7 +159,17 @@ export class BitbucketPaginator {
       maxPagelen = BITBUCKET_MAX_PAGELEN,
       maxItems = BITBUCKET_ALL_ITEMS_CAP,
       description,
+      rejectAccepted = false,
     } = options;
+    const checkAccepted = (
+      response: { status?: number },
+      request: PendingRequestConfig,
+      pagesBefore: number
+    ) => {
+      if (rejectAccepted && response.status === 202) {
+        throw new PaginationPendingError(request.url, pagesBefore);
+      }
+    };
 
     const resolvedPagelen = this.normalizePagelen(
       pagelen ?? defaultPagelen,
@@ -174,6 +200,7 @@ export class BitbucketPaginator {
         requestDescriptor,
         description
       );
+      checkAccepted(response, requestDescriptor, 0);
       const values = this.extractValues<T>(response.data);
       // The budget has to be enforced here too, not just while following `next`
       // links: with an explicit `page` the page size is pinned, and some
@@ -217,6 +244,7 @@ export class BitbucketPaginator {
       const response = await this.performRequest(nextRequest, description, {
         page: fetchedPages + 1,
       });
+      checkAccepted(response, nextRequest, fetchedPages);
       fetchedPages += 1;
 
       if (fetchedPages === 1) {

@@ -339,6 +339,7 @@ Creates a new pull request.
 - `targetBranch`: Target branch name
 - `reviewers` (optional): List of reviewer usernames
 - `draft` (optional): Whether to create the pull request as a draft
+- `closeSourceBranch` (optional): Close the source branch after merge (default `true`; `false` keeps it)
 
 #### `getPullRequest`
 
@@ -363,9 +364,15 @@ Updates a pull request.
 - `workspace`: Bitbucket workspace name
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
-- Pagination controls described in [Pagination](#pagination)
-- Pagination controls described in [Pagination](#pagination)
-- Various optional update parameters (title, description, etc.)
+- `title` (optional): New title
+- `description` (optional): New description
+- `destinationBranch` (optional): New destination branch name
+- `closeSourceBranch` (optional): Whether to close the source branch after merge
+- `reviewers` (optional): REPLACES the full reviewer list (`[]` removes all). Ids are `{uuid}`, a bare uuid, or an Atlassian `account_id`. Cannot be combined with `addReviewers`/`removeReviewers`
+- `addReviewers` (optional): Reviewers to add to the current list (same id formats)
+- `removeReviewers` (optional): Reviewers to remove from the current list (same id formats). An id that matches no current reviewer fails the call with `InvalidParams` (listing the current reviewers) and nothing is sent
+
+When any reviewer argument is `addReviewers`/`removeReviewers`, the current reviewers are fetched first and the full intended list is sent. At least one field must be given, otherwise `InvalidParams` is returned.
 
 #### `getPullRequestActivity`
 
@@ -421,10 +428,46 @@ Merges a pull request.
 - `strategy` (optional): Merge strategy (`merge_commit`, `squash`, `fast_forward`).
   The hyphenated aliases `merge-commit` / `fast-forward` are accepted and normalized;
   anything else is rejected with `InvalidParams` instead of reaching Bitbucket.
+- `closeSourceBranch` (optional): Close the source branch after merge. If omitted, Bitbucket uses the value set at creation; `false` is sent as-is
+- `async` (optional): Merge asynchronously. When Bitbucket answers `202` (always with `async: true`, also for slow merges and merge queues) the tool returns `{ status: "PENDING", task_id, task_status_url, message }`; poll `getPullRequestMergeTaskStatus`
 
-#### `requestChanges`
+#### `getPullRequestMergeTaskStatus`
 
-Requests changes on a pull request.
+Gets the status of an asynchronous merge. Unknown or expired task ids report `PENDING`.
+
+**Parameters:**
+
+- `workspace`: Bitbucket workspace name
+- `repo_slug`: Repository slug
+- `pull_request_id`: Pull request ID
+- `task_id`: Task id returned by `mergePullRequest`
+
+#### `getPullRequestsForCommit`
+
+Lists pull requests containing a commit. Needs the Pull Request Commit Links app (installed when someone clicks "Go to pull request" on a commit page in the web UI). While the repository is being indexed (`202`) the tool returns `{ indexing: true, values: [] }`; a `404` is reported as an error naming both possible causes.
+
+**Parameters:**
+
+- `workspace`: Bitbucket workspace name
+- `repo_slug`: Repository slug
+- `commit`: Commit hash
+- Pagination controls described in [Pagination](#pagination)
+
+#### `getUserPullRequests`
+
+Lists pull requests AUTHORED by a user across a workspace (not those they review). Only `OPEN` pull requests unless `state` is given.
+
+**Parameters:**
+
+- `workspace` (optional): Workspace; defaults to the configured default workspace
+- `selected_user` (optional): Username, `{uuid}` or Atlassian account id; defaults to the authenticated user (`GET /user`, which fails for workspace/repository access tokens, so pass it there)
+- `state` (optional): One of or an array of `OPEN`, `MERGED`, `DECLINED`, `SUPERSEDED`
+- `q`, `sort` (optional): Bitbucket query/sort
+- Pagination controls described in [Pagination](#pagination)
+
+#### `requestChangesPullRequest`
+
+Requests changes on a pull request as the authenticated user.
 
 **Parameters:**
 
@@ -432,9 +475,9 @@ Requests changes on a pull request.
 - `repo_slug`: Repository slug
 - `pull_request_id`: Pull request ID
 
-#### `removeChangeRequest`
+#### `unrequestChangesPullRequest`
 
-Removes a change request from a pull request.
+Withdraws the authenticated user's change request from a pull request.
 
 **Parameters:**
 
@@ -455,6 +498,7 @@ Creates a new draft pull request.
 - `sourceBranch`: Source branch name
 - `targetBranch`: Target branch name
 - `reviewers` (optional): List of reviewer usernames
+- `closeSourceBranch` (optional): Close the source branch after merge (default `true`; `false` keeps it)
 
 **Note:** This is equivalent to calling `createPullRequest` with `draft: true`.
 

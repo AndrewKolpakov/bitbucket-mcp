@@ -20,12 +20,20 @@ import {
   BITBUCKET_MAX_PAGELEN,
   BITBUCKET_PULLREQUEST_MAX_PAGELEN,
 } from "./pagination.js";
-import { resolvePagination } from "./pagination.js";
+import { PaginationPendingError, resolvePagination } from "./pagination.js";
 import type { PaginatedValuesResult } from "./pagination.js";
 import { attachRetryInterceptor, DEFAULT_MAX_RETRIES } from "./retry.js";
 import { buildAuthHeaders } from "./auth.js";
 import { normalizeMergeStrategy } from "./merge-strategy.js";
 import type { MergeStrategy } from "./merge-strategy.js";
+import {
+  buildMergeBody,
+  buildPullRequestUpdate,
+  buildStateQuery,
+  computeReviewers,
+  findUnmatchedRemovals,
+  parseMergeTaskId,
+} from "./pull-request-ops.js";
 import {
   isPendingReviewer,
   rankPendingReviewPRs,
@@ -787,6 +795,11 @@ class BitbucketServer {
                 type: "boolean",
                 description: "Whether to create the pull request as a draft",
               },
+              closeSourceBranch: {
+                type: "boolean",
+                description:
+                  "Close the source branch after merge. Defaults to true when omitted; pass false to keep it",
+              },
             },
             required: [
               "workspace",
@@ -840,8 +853,162 @@ class BitbucketServer {
                 type: "string",
                 description: "New pull request description",
               },
+              destinationBranch: {
+                type: "string",
+                description: "New destination (target) branch name",
+              },
+              closeSourceBranch: {
+                type: "boolean",
+                description: "Whether to close the source branch after merge",
+              },
+              reviewers: {
+                type: "array",
+                items: { type: "string" },
+                description:
+                  "REPLACES the full reviewer list ([] removes all reviewers). Each id is a '{uuid}', a bare uuid, or an Atlassian account_id. Cannot be combined with addReviewers/removeReviewers",
+              },
+              addReviewers: {
+                type: "array",
+                items: { type: "string" },
+                description:
+                  "Reviewers to add to the current list. Each id is a '{uuid}', a bare uuid, or an Atlassian account_id",
+              },
+              removeReviewers: {
+                type: "array",
+                items: { type: "string" },
+                description:
+                  "Reviewers to remove from the current list. Each id is a '{uuid}', a bare uuid, or an Atlassian account_id",
+              },
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
+          },
+        },
+        {
+          name: "requestChangesPullRequest",
+          description:
+            "Request changes on a pull request as the authenticated user",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description: "Bitbucket workspace name",
+              },
+              repo_slug: { type: "string", description: "Repository slug" },
+              pull_request_id: {
+                type: "string",
+                description: "Pull request ID",
+              },
+            },
+            required: ["workspace", "repo_slug", "pull_request_id"],
+          },
+        },
+        {
+          name: "unrequestChangesPullRequest",
+          description:
+            "Withdraw the authenticated user's change request on a pull request",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description: "Bitbucket workspace name",
+              },
+              repo_slug: { type: "string", description: "Repository slug" },
+              pull_request_id: {
+                type: "string",
+                description: "Pull request ID",
+              },
+            },
+            required: ["workspace", "repo_slug", "pull_request_id"],
+          },
+        },
+        {
+          name: "getPullRequestMergeTaskStatus",
+          description:
+            "Get the status of an asynchronous merge (task_id comes from mergePullRequest). Returns PENDING or SUCCESS with the merge result; a failed merge is reported as an error. Unknown or expired task ids report PENDING",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description: "Bitbucket workspace name",
+              },
+              repo_slug: { type: "string", description: "Repository slug" },
+              pull_request_id: {
+                type: "string",
+                description: "Pull request ID",
+              },
+              task_id: {
+                type: "string",
+                description: "Merge task id returned by mergePullRequest",
+              },
+            },
+            required: ["workspace", "repo_slug", "pull_request_id", "task_id"],
+          },
+        },
+        {
+          name: "getPullRequestsForCommit",
+          description:
+            "List pull requests that contain a given commit. Requires the Pull Request Commit Links app (installed when someone clicks 'Go to pull request' on a commit page in the web UI); returns an explicit indexing result while the repository is still being indexed",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description: "Bitbucket workspace name",
+              },
+              repo_slug: { type: "string", description: "Repository slug" },
+              commit: { type: "string", description: "Commit hash" },
+              ...paginationBaseSchema(),
+              all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
+              limit: LEGACY_LIMIT_SCHEMA,
+            },
+            required: ["workspace", "repo_slug", "commit"],
+          },
+        },
+        {
+          name: "getUserPullRequests",
+          description:
+            "List pull requests AUTHORED by a user across a workspace (not those they review). Only OPEN pull requests unless state is given",
+          inputSchema: {
+            type: "object",
+            properties: {
+              workspace: {
+                type: "string",
+                description:
+                  "Bitbucket workspace name (defaults to the configured default workspace)",
+              },
+              selected_user: {
+                type: "string",
+                description:
+                  "Author: username, '{uuid}' or Atlassian account id. Defaults to the authenticated user (GET /user, which fails for workspace/repository access tokens: pass it then)",
+              },
+              state: {
+                oneOf: [
+                  {
+                    type: "string",
+                    enum: ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"],
+                  },
+                  {
+                    type: "array",
+                    items: {
+                      type: "string",
+                      enum: ["OPEN", "MERGED", "DECLINED", "SUPERSEDED"],
+                    },
+                  },
+                ],
+                description:
+                  "One state or several (OPEN, MERGED, DECLINED, SUPERSEDED). Default: OPEN only",
+              },
+              ...paginationBaseSchema(BITBUCKET_PULLREQUEST_MAX_PAGELEN),
+              ...QUERY_SORT_SCHEMA,
+              all: PAGINATION_ALL_SCHEMA,
+              maxItems: PAGINATION_MAX_ITEMS_SCHEMA,
+              limit: LEGACY_LIMIT_SCHEMA,
+            },
+            required: [],
           },
         },
         {
@@ -951,6 +1118,16 @@ class BitbucketServer {
                 enum: ["merge_commit", "squash", "fast_forward"],
                 description:
                   "Merge strategy. Hyphenated aliases (merge-commit, fast-forward) are also accepted",
+              },
+              closeSourceBranch: {
+                type: "boolean",
+                description:
+                  "Close the source branch after merge. If omitted, Bitbucket uses the value set when the pull request was created",
+              },
+              async: {
+                type: "boolean",
+                description:
+                  "Merge asynchronously (async=true). Returns a task_id to poll with getPullRequestMergeTaskStatus. Merge queues and slow merges also answer asynchronously without this flag",
               },
             },
             required: ["workspace", "repo_slug", "pull_request_id"],
@@ -1365,6 +1542,11 @@ class BitbucketServer {
                 items: { type: "string" },
                 description:
                   "List of reviewer UUIDs (e.g., '{04776764-62c7-453b-b97e-302f60395ceb}')",
+              },
+              closeSourceBranch: {
+                type: "boolean",
+                description:
+                  "Close the source branch after merge. Defaults to true when omitted; pass false to keep it",
               },
             },
             required: [
@@ -2082,7 +2264,8 @@ class BitbucketServer {
               args.sourceBranch as string,
               args.targetBranch as string,
               args.reviewers as string[] | undefined,
-              args.draft as boolean
+              args.draft as boolean,
+              args.closeSourceBranch as boolean | undefined
             );
           case "getPullRequest":
             return await this.getPullRequest(
@@ -2096,7 +2279,55 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.title as string,
-              args.description as string
+              args.description as string,
+              args.destinationBranch as string | undefined,
+              args.closeSourceBranch as boolean | undefined,
+              args.reviewers as string[] | undefined,
+              args.addReviewers as string[] | undefined,
+              args.removeReviewers as string[] | undefined
+            );
+          case "requestChangesPullRequest":
+            return await this.requestChangesPullRequest(
+              args.workspace as string,
+              args.repo_slug as string,
+              args.pull_request_id as string
+            );
+          case "unrequestChangesPullRequest":
+            return await this.unrequestChangesPullRequest(
+              args.workspace as string,
+              args.repo_slug as string,
+              args.pull_request_id as string
+            );
+          case "getPullRequestMergeTaskStatus":
+            return await this.getPullRequestMergeTaskStatus(
+              args.workspace as string,
+              args.repo_slug as string,
+              args.pull_request_id as string,
+              args.task_id as string
+            );
+          case "getPullRequestsForCommit":
+            return await this.getPullRequestsForCommit(
+              args.workspace as string,
+              args.repo_slug as string,
+              args.commit as string,
+              args.pagelen as number,
+              args.page as number,
+              args.all as boolean,
+              args.limit as number,
+              args.maxItems as number
+            );
+          case "getUserPullRequests":
+            return await this.getUserPullRequests(
+              args.workspace as string | undefined,
+              args.selected_user as string | undefined,
+              args.state as string | string[] | undefined,
+              args.q as string | undefined,
+              args.sort as string | undefined,
+              args.pagelen as number,
+              args.page as number,
+              args.all as boolean,
+              args.limit as number,
+              args.maxItems as number
             );
           case "getPullRequestActivity":
             return await this.getPullRequestActivity(
@@ -2133,7 +2364,9 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.message as string,
-              args.strategy as string | undefined
+              args.strategy as string | undefined,
+              args.closeSourceBranch as boolean | undefined,
+              args.async as boolean | undefined
             );
           case "getPullRequestComments":
             return await this.getPullRequestComments(
@@ -2236,7 +2469,8 @@ class BitbucketServer {
               args.description as string,
               args.sourceBranch as string,
               args.targetBranch as string,
-              args.reviewers as string[]
+              args.reviewers as string[],
+              args.closeSourceBranch as boolean | undefined
             );
           case "publishDraftPullRequest":
             return await this.publishDraftPullRequest(
@@ -2670,7 +2904,8 @@ class BitbucketServer {
     sourceBranch: string,
     targetBranch: string,
     reviewers?: string[],
-    draft?: boolean
+    draft?: boolean,
+    closeSourceBranch?: boolean
   ) {
     try {
       logger.info("Creating Bitbucket pull request", {
@@ -2711,7 +2946,7 @@ class BitbucketServer {
             name: targetBranch,
           },
         },
-        close_source_branch: true,
+        close_source_branch: closeSourceBranch ?? true,
       };
 
       // Only include reviewers field if there are reviewers to add
@@ -2798,8 +3033,35 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     title?: string,
-    description?: string
+    description?: string,
+    destinationBranch?: string,
+    closeSourceBranch?: boolean,
+    reviewers?: string[],
+    addReviewers?: string[],
+    removeReviewers?: string[]
   ) {
+    const prUrl = `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`;
+    const wantsReviewerChange =
+      reviewers !== undefined ||
+      addReviewers !== undefined ||
+      removeReviewers !== undefined;
+
+    // Validate before any network call so bad input is InvalidParams.
+    if (
+      reviewers !== undefined &&
+      (addReviewers !== undefined || removeReviewers !== undefined)
+    ) {
+      try {
+        computeReviewers([], {
+          set: reviewers,
+          add: addReviewers,
+          remove: removeReviewers,
+        });
+      } catch (error) {
+        throw new McpError(ErrorCode.InvalidParams, describeError(error));
+      }
+    }
+
     try {
       logger.info("Updating Bitbucket pull request", {
         workspace,
@@ -2807,15 +3069,58 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      // Only include fields that are provided
-      const updateData: Record<string, any> = {};
-      if (title !== undefined) updateData.title = title;
-      if (description !== undefined) updateData.description = description;
+      let reviewerRefs;
+      if (wantsReviewerChange) {
+        // The current list is only needed for add/remove; a full replacement
+        // does not depend on it.
+        let current: any[] = [];
+        if (reviewers === undefined) {
+          const existing = await this.api.get(prUrl);
+          current = existing.data?.reviewers ?? [];
+        }
+        let unmatched: string[] = [];
+        try {
+          unmatched = findUnmatchedRemovals(current, removeReviewers);
+        } catch (error) {
+          throw new McpError(ErrorCode.InvalidParams, describeError(error));
+        }
+        if (unmatched.length > 0) {
+          const list = current
+            .map(
+              (a: any) =>
+                `${a.display_name ?? "?"} (${a.uuid ?? "no uuid"}, ${a.account_id ?? "no account_id"})`
+            )
+            .join("; ");
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `removeReviewers did not match any current reviewer: ${unmatched.join(", ")}. Current reviewers: ${list || "(none)"}.`
+          );
+        }
+        try {
+          reviewerRefs = computeReviewers(current, {
+            set: reviewers,
+            add: addReviewers,
+            remove: removeReviewers,
+          });
+        } catch (error) {
+          throw new McpError(ErrorCode.InvalidParams, describeError(error));
+        }
+      }
 
-      const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
-        updateData
-      );
+      let updateData: Record<string, unknown>;
+      try {
+        updateData = buildPullRequestUpdate({
+          title,
+          description,
+          destinationBranch,
+          closeSourceBranch,
+          reviewers: reviewerRefs,
+        });
+      } catch (error) {
+        throw new McpError(ErrorCode.InvalidParams, describeError(error));
+      }
+
+      const response = await this.api.put(prUrl, updateData);
 
       return {
         content: [
@@ -2826,6 +3131,7 @@ class BitbucketServer {
         ],
       };
     } catch (error) {
+      if (error instanceof McpError) throw error;
       logger.error("Error updating pull request", {
         error,
         workspace,
@@ -2837,6 +3143,282 @@ class BitbucketServer {
         `Failed to update pull request: ${
           describeError(error)
         }`
+      );
+    }
+  }
+
+  async requestChangesPullRequest(
+    workspace: string,
+    repo_slug: string,
+    pull_request_id: string
+  ) {
+    try {
+      logger.info("Requesting changes on Bitbucket pull request", {
+        workspace,
+        repo_slug,
+        pull_request_id,
+      });
+      const response = await this.api.post(
+        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/request-changes`
+      );
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(response.data, null, 2) },
+        ],
+      };
+    } catch (error) {
+      logger.error("Error requesting changes on pull request", {
+        error,
+        workspace,
+        repo_slug,
+        pull_request_id,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to request changes on pull request: ${describeError(error)}`
+      );
+    }
+  }
+
+  async unrequestChangesPullRequest(
+    workspace: string,
+    repo_slug: string,
+    pull_request_id: string
+  ) {
+    try {
+      logger.info("Withdrawing change request on Bitbucket pull request", {
+        workspace,
+        repo_slug,
+        pull_request_id,
+      });
+      await this.api.delete(
+        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/request-changes`
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                status: "OK",
+                message: "Change request withdrawn successfully.",
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      logger.error("Error withdrawing change request", {
+        error,
+        workspace,
+        repo_slug,
+        pull_request_id,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to withdraw change request: ${describeError(error)}`
+      );
+    }
+  }
+
+  async getPullRequestMergeTaskStatus(
+    workspace: string,
+    repo_slug: string,
+    pull_request_id: string,
+    task_id: string
+  ) {
+    try {
+      logger.info("Getting Bitbucket merge task status", {
+        workspace,
+        repo_slug,
+        pull_request_id,
+        task_id,
+      });
+      const response = await this.api.get(
+        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge/task-status/${encodeURIComponent(task_id)}`
+      );
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(response.data, null, 2) },
+        ],
+      };
+    } catch (error) {
+      logger.error("Error getting merge task status", {
+        error,
+        workspace,
+        repo_slug,
+        pull_request_id,
+        task_id,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get merge task status: ${describeError(error)}`
+      );
+    }
+  }
+
+  async getPullRequestsForCommit(
+    workspace: string,
+    repo_slug: string,
+    commit: string,
+    pagelen?: number,
+    page?: number,
+    all?: boolean,
+    legacyLimit?: number,
+    maxItems?: number
+  ) {
+    const url = `/repositories/${workspace}/${repo_slug}/commit/${encodeURIComponent(commit)}/pullrequests`;
+    try {
+      logger.info("Getting pull requests for commit", {
+        workspace,
+        repo_slug,
+        commit,
+      });
+
+      // Bitbucket answers 202 with an empty body while it is still indexing.
+      // Read as a page that is a silent "no pull requests", so the paginator
+      // rejects a 202 on any page, not only the first.
+      const result = await this.paginator.fetchValues<BitbucketPullRequest>(
+        url,
+        {
+          ...resolvePagination({
+            pagelen,
+            page,
+            all,
+            limit: legacyLimit,
+            maxItems,
+          }),
+          description: "getPullRequestsForCommit",
+          rejectAccepted: true,
+        }
+      );
+      return paginatedContent(result);
+    } catch (error) {
+      if (error instanceof PaginationPendingError) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  indexing: true,
+                  values: [],
+                  message:
+                    error.fetchedPages > 0
+                      ? `The repository's pull requests are still being indexed (page ${error.fetchedPages + 1} answered 202); the partial result was discarded. Retry later.`
+                      : "The repository's pull requests are still being indexed; retry later.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Pull requests for commit ${commit} not found (404). Either the repository ${workspace}/${repo_slug} does not exist, or the Pull Request Commit Links app is not installed / the commits are not indexed yet (it installs when someone clicks "Go to pull request" on a commit page in the Bitbucket web UI).`
+        );
+      }
+      logger.error("Error getting pull requests for commit", {
+        error,
+        workspace,
+        repo_slug,
+        commit,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get pull requests for commit: ${describeError(error)}`
+      );
+    }
+  }
+
+  async getUserPullRequests(
+    workspace?: string,
+    selectedUser?: string,
+    state?: string | string[],
+    q?: string,
+    sort?: string,
+    pagelen?: number,
+    page?: number,
+    all?: boolean,
+    legacyLimit?: number,
+    maxItems?: number
+  ) {
+    const ws = workspace || this.config.defaultWorkspace;
+    if (!ws) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "workspace is required (no default workspace is configured)."
+      );
+    }
+    let stateQuery: string;
+    try {
+      stateQuery = buildStateQuery(state);
+    } catch (error) {
+      throw new McpError(ErrorCode.InvalidParams, describeError(error));
+    }
+
+    let user = selectedUser?.trim();
+    if (!user) {
+      try {
+        const me = await this.api.get("/user");
+        user = me.data?.uuid;
+      } catch (error) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Could not determine the authenticated user (GET /user failed: ${describeError(error)}). Pass selected_user explicitly.`
+        );
+      }
+      if (!user) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Could not determine the authenticated user. Pass selected_user explicitly."
+        );
+      }
+    }
+
+    try {
+      logger.info("Getting Bitbucket user pull requests", {
+        workspace: ws,
+        selected_user: user,
+        state,
+      });
+      const params: Record<string, any> = {};
+      if (q) params.q = q;
+      if (sort) params.sort = sort;
+
+      // The state query lives in the URL (repeated state=... params); axios
+      // appends `pagelen` etc. with "&" when the URL already has a "?".
+      const result = await this.paginator.fetchValues<BitbucketPullRequest>(
+        `/workspaces/${ws}/pullrequests/${encodeURIComponent(user)}${
+          stateQuery ? `?${stateQuery}` : ""
+        }`,
+        {
+          ...resolvePagination({
+            pagelen,
+            page,
+            all,
+            limit: legacyLimit,
+            maxItems,
+            maxPagelen: BITBUCKET_PULLREQUEST_MAX_PAGELEN,
+          }),
+          params,
+          description: "getUserPullRequests",
+        }
+      );
+      return paginatedContent(result);
+    } catch (error) {
+      logger.error("Error getting user pull requests", {
+        error,
+        workspace: ws,
+      });
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to get user pull requests: ${describeError(error)}`
       );
     }
   }
@@ -3024,7 +3606,9 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     message?: string,
-    strategy?: string
+    strategy?: string,
+    closeSourceBranch?: boolean,
+    asyncMerge?: boolean
   ) {
     // Bitbucket wants merge_commit / squash / fast_forward; older callers may
     // still send the hyphenated spelling this server used to advertise.
@@ -3043,15 +3627,60 @@ class BitbucketServer {
         strategy: mergeStrategy,
       });
 
-      // Build request data
-      const data: Record<string, any> = {};
-      if (message) data.message = message;
-      if (mergeStrategy) data.merge_strategy = mergeStrategy;
+      const data = buildMergeBody({
+        message,
+        strategy: mergeStrategy,
+        closeSourceBranch,
+      });
 
       const response = await this.api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge`,
-        data
+        data,
+        asyncMerge === true ? { params: { async: true } } : undefined
       );
+
+      if (response.status === 202) {
+        const location = response.headers?.["location"] as string | undefined;
+        const taskId = parseMergeTaskId(location);
+        if (!taskId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "PENDING",
+                    task_id: null,
+                    task_status_url: null,
+                    message:
+                      "Merge accepted and still in progress, but no task id was returned. Check the pull request state with getPullRequest instead of polling.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "PENDING",
+                  task_id: taskId,
+                  task_status_url: location,
+                  message:
+                    "Merge accepted and still in progress. Poll getPullRequestMergeTaskStatus with this task_id until it reports SUCCESS or an error.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
 
       return {
         content: [
@@ -3735,7 +4364,8 @@ class BitbucketServer {
     description: string,
     sourceBranch: string,
     targetBranch: string,
-    reviewers?: string[]
+    reviewers?: string[],
+    closeSourceBranch?: boolean
   ) {
     try {
       logger.info("Creating draft Bitbucket pull request", {
@@ -3755,7 +4385,8 @@ class BitbucketServer {
         sourceBranch,
         targetBranch,
         reviewers,
-        true // Set draft to true
+        true, // Set draft to true
+        closeSourceBranch
       );
     } catch (error) {
       logger.error("Error creating draft pull request", {

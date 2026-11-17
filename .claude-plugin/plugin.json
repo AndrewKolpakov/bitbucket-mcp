@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "bitbucket-mcp",
   "displayName": "MCP Bitbucket",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bitbucket repositories, pull requests, comments and pipelines over MCP, with pagination metadata, sorting and retries. Reads the same credentials file as the mcp-atlassian plugin.",
   "author": {
     "name": "Andrew Kolpakov",
